@@ -7,6 +7,8 @@
 #include <random>
 #include <sstream>
 #include <algorithm>
+#include <atomic>
+#include <thread>
 #include "engine.hpp"
 
 namespace py = pybind11;
@@ -140,6 +142,39 @@ static void encode(const State& s, int mode2v2, float* f) {
   std::fill(f + 23 * 64, f + 24 * 64, 1.f);
 }
 
+// Compact 80-byte encoding expanded to planes on the accelerator (model.expand):
+// [0,64) square: 0 empty else 1+color*6+type, +16 if resting; [64] castling bits
+// (wK,wQ,bK,bQ); [65] noProgress; [66] repetitions-1 (clamped); [67] mode;
+// [68,72) en passant entries (color<<6 | to) or 255.
+static const int NCOMPACT = 80;
+static void encodeCompact(const State& s, int mode2v2, uint8_t* o) {
+  std::fill(o, o + NCOMPACT, 0);
+  for (int i = 0; i < 64; i++) {
+    const Piece& p = s.board[i];
+    if (!p.empty()) o[i] = 1 + p.color * 6 + p.type + (p.resting ? 16 : 0);
+  }
+  uint8_t bits = 0;
+  for (int color = 0; color < 2; color++) {
+    int home = color == WHITE ? 56 : 0;
+    const Piece& k = s.board[home + 4];
+    for (int fl = 0; fl < 2; fl++) {
+      const Piece& r = s.board[home + (fl ? 0 : 7)];
+      if (k.color == color && k.type == K && !k.hasMoved && r.color == color && r.type == R && !r.hasMoved) bits |= 1 << (color * 2 + fl);
+    }
+  }
+  o[64] = bits;
+  o[65] = (uint8_t)std::min(s.noProgress, 255);
+  o[66] = (uint8_t)std::min(std::max(0, s.repetitions() - 1), 255);
+  o[67] = (uint8_t)mode2v2;
+  for (int i = 0; i < 4; i++) o[68 + i] = i < s.nEp ? (uint8_t)((s.ep[i].color << 6) | s.ep[i].to) : 255;
+}
+
+static py::array_t<uint8_t> compact(const Game& g, int mode) {
+  py::array_t<uint8_t> a(NCOMPACT);
+  encodeCompact(g.s, mode, a.mutable_data());
+  return a;
+}
+
 static py::array_t<float> features(const Game& g, int mode) {
   py::array_t<float> a({NPLANES, 8, 8});
   encode(g.s, mode, a.mutable_data());
@@ -175,37 +210,86 @@ static std::vector<int> policyIndices(const std::vector<int>& codes, bool flip) 
   return o;
 }
 
-// All successor states of a joint action matrix. Actions for 1v1 are move
-// codes; for 2v2 pairs of codes. Returns (features[nW*nB,...], result[nW*nB]).
-static py::tuple successors(const Game& g, int mode,
-                            const std::vector<std::pair<int,int>>& wa,
-                            const std::vector<std::pair<int,int>>& ba,
-                            bool wantFeatures) {
-  std::vector<Move> wl, bl; legalMoves(g.s, WHITE, wl); legalMoves(g.s, BLACK, bl);
-  auto dec = [](const std::vector<Move>& l, std::pair<int,int> p, Move* m, bool* h) {
-    h[0] = p.first >= 0 && findMove(l, p.first, m[0]);
-    h[1] = p.second >= 0 && findMove(l, p.second, m[1]);
-  };
-  size_t nW = wa.size(), nB = ba.size(), n = nW * nB;
-  std::vector<std::array<Move,2>> wm(nW), bm(nB);
-  std::vector<std::array<bool,2>> wh(nW), bh(nB);
-  for (size_t i = 0; i < nW; i++) { bool h[2]; dec(wl, wa[i], wm[i].data(), h); wh[i] = {h[0], h[1]}; }
-  for (size_t j = 0; j < nB; j++) { bool h[2]; dec(bl, ba[j], bm[j].data(), h); bh[j] = {h[0], h[1]}; }
-  py::array_t<float> feats(wantFeatures ? std::vector<py::ssize_t>{(py::ssize_t)n, NPLANES, 8, 8} : std::vector<py::ssize_t>{0});
-  py::array_t<int8_t> res((py::ssize_t)n);
-  float* fp = wantFeatures ? feats.mutable_data() : nullptr;
+// All successor states of joint action matrices for a batch of positions.
+// Actions for 1v1 are (code,-1); for 2v2 pairs of codes. Returns
+// (compact[sum nW*nB, 80] uint8, result[sum] int8), row-major per position.
+struct Job {
+  const State* s; int mode;
+  std::vector<std::array<Move,2>> wm, bm;
+  std::vector<std::array<bool,2>> wh, bh;
+  size_t offset;
+};
+
+static void decodeActions(const std::vector<Move>& l, const std::vector<std::pair<int,int>>& acts,
+                          std::vector<std::array<Move,2>>& m, std::vector<std::array<bool,2>>& h) {
+  m.resize(acts.size()); h.resize(acts.size());
+  for (size_t i = 0; i < acts.size(); i++) {
+    h[i][0] = acts[i].first >= 0 && findMove(l, acts[i].first, m[i][0]);
+    h[i][1] = acts[i].second >= 0 && findMove(l, acts[i].second, m[i][1]);
+  }
+}
+
+static py::tuple successorsBatch(const std::vector<const Game*>& games, const std::vector<int>& modes,
+                                 const std::vector<std::vector<std::pair<int,int>>>& was,
+                                 const std::vector<std::vector<std::pair<int,int>>>& bas, int threads) {
+  size_t G = games.size(), total = 0;
+  std::vector<Job> jobs(G);
+  for (size_t k = 0; k < G; k++) {
+    Job& j = jobs[k];
+    j.s = &games[k]->s; j.mode = modes[k];
+    std::vector<Move> wl, bl; legalMoves(*j.s, WHITE, wl); legalMoves(*j.s, BLACK, bl);
+    decodeActions(wl, was[k], j.wm, j.wh);
+    decodeActions(bl, bas[k], j.bm, j.bh);
+    j.offset = total;
+    total += j.wm.size() * j.bm.size();
+  }
+  py::array_t<uint8_t> feats({(py::ssize_t)total, (py::ssize_t)NCOMPACT});
+  py::array_t<int8_t> res((py::ssize_t)total);
+  uint8_t* fp = feats.mutable_data();
   int8_t* rp = res.mutable_data();
   {
     py::gil_scoped_release nogil;
-    for (size_t i = 0; i < nW; i++) for (size_t j = 0; j < nB; j++) {
-      State nx;
-      if (mode == 0) nx = resolve1v1(g.s, wh[i][0] ? &wm[i][0] : nullptr, bh[j][0] ? &bm[j][0] : nullptr);
-      else nx = resolve2v2(g.s, wh[i][0] ? &wm[i][0] : nullptr, wh[i][1] ? &wm[i][1] : nullptr,
-                           bh[j][0] ? &bm[j][0] : nullptr, bh[j][1] ? &bm[j][1] : nullptr);
-      size_t k = i * nB + j;
-      rp[k] = nx.result;
-      if (fp) encode(nx, mode, fp + k * NPLANES * 64);
-    }
+    std::atomic<size_t> next(0);
+    auto work = [&]() {
+      for (size_t k; (k = next.fetch_add(1)) < G;) {
+        const Job& j = jobs[k];
+        size_t nB = j.bm.size();
+        for (size_t a = 0; a < j.wm.size(); a++) for (size_t b = 0; b < nB; b++) {
+          State nx;
+          if (j.mode == 0) nx = resolve1v1(*j.s, j.wh[a][0] ? &j.wm[a][0] : nullptr, j.bh[b][0] ? &j.bm[b][0] : nullptr);
+          else nx = resolve2v2(*j.s, j.wh[a][0] ? &j.wm[a][0] : nullptr, j.wh[a][1] ? &j.wm[a][1] : nullptr,
+                               j.bh[b][0] ? &j.bm[b][0] : nullptr, j.bh[b][1] ? &j.bm[b][1] : nullptr);
+          size_t idx = j.offset + a * nB + b;
+          rp[idx] = nx.result;
+          encodeCompact(nx, j.mode, fp + idx * NCOMPACT);
+        }
+      }
+    };
+    int nt = std::max(1, std::min<int>(threads, (int)G));
+    std::vector<std::thread> pool;
+    for (int t = 1; t < nt; t++) pool.emplace_back(work);
+    work();
+    for (auto& t : pool) t.join();
+  }
+  return py::make_tuple(feats, res);
+}
+
+// Single-position float features (tests / debugging).
+static py::tuple successors(const Game& g, int mode,
+                            const std::vector<std::pair<int,int>>& wa,
+                            const std::vector<std::pair<int,int>>& ba) {
+  std::vector<Move> wl, bl; legalMoves(g.s, WHITE, wl); legalMoves(g.s, BLACK, bl);
+  std::vector<std::array<Move,2>> wm, bm; std::vector<std::array<bool,2>> wh, bh;
+  decodeActions(wl, wa, wm, wh); decodeActions(bl, ba, bm, bh);
+  size_t nW = wm.size(), nB = bm.size(), n = nW * nB;
+  py::array_t<float> feats({(py::ssize_t)n, (py::ssize_t)NPLANES, (py::ssize_t)8, (py::ssize_t)8});
+  py::array_t<int8_t> res((py::ssize_t)n);
+  for (size_t i = 0; i < nW; i++) for (size_t j = 0; j < nB; j++) {
+    State nx = mode == 0 ? resolve1v1(g.s, wh[i][0] ? &wm[i][0] : nullptr, bh[j][0] ? &bm[j][0] : nullptr)
+                         : resolve2v2(g.s, wh[i][0] ? &wm[i][0] : nullptr, wh[i][1] ? &wm[i][1] : nullptr,
+                                      bh[j][0] ? &bm[j][0] : nullptr, bh[j][1] ? &bm[j][1] : nullptr);
+    res.mutable_data()[i * nB + j] = nx.result;
+    encode(nx, mode, feats.mutable_data() + (i * nB + j) * NPLANES * 64);
   }
   return py::make_tuple(feats, res);
 }
@@ -248,6 +332,72 @@ static py::tuple solveNash(py::array_t<double, py::array::c_style | py::array::f
   for (int j = 0; j < n; j++) Y.mutable_data()[j] = sy[j] / ty;
   for (int i = 0; i < m; i++) for (int j = 0; j < n; j++) val += X.data()[i] * A[i * n + j] * Y.data()[j];
   return py::make_tuple(X, Y, val);
+}
+
+static void nashCore(const double* A, int m, int n, int iters, double* X, double* Y, double* val) {
+  std::vector<double> rx(m, 0), ry(n, 0), x(m, 1.0 / m), y(n, 1.0 / n), sx(m, 0), sy(n, 0), u(std::max(m, n));
+  auto norm = [](std::vector<double>& r, std::vector<double>& p) {
+    double s = 0; for (double v : r) s += v;
+    if (s <= 0) { for (auto& v : p) v = 1.0 / p.size(); return; }
+    for (size_t i = 0; i < p.size(); i++) p[i] = r[i] / s;
+  };
+  for (int t = 1; t <= iters; t++) {
+    double ev = 0;
+    for (int i = 0; i < m; i++) { double s = 0; const double* row = A + (size_t)i * n; for (int j = 0; j < n; j++) s += row[j] * y[j]; u[i] = s; ev += s * x[i]; }
+    for (int i = 0; i < m; i++) rx[i] = std::max(0.0, rx[i] + u[i] - ev);
+    norm(rx, x);
+    for (int i = 0; i < m; i++) sx[i] += t * x[i];
+    std::fill(u.begin(), u.begin() + n, 0.0);
+    for (int i = 0; i < m; i++) { const double* row = A + (size_t)i * n; double xi = x[i]; for (int j = 0; j < n; j++) u[j] -= row[j] * xi; }
+    ev = 0; for (int j = 0; j < n; j++) ev += u[j] * y[j];
+    for (int j = 0; j < n; j++) ry[j] = std::max(0.0, ry[j] + u[j] - ev);
+    norm(ry, y);
+    for (int j = 0; j < n; j++) sy[j] += t * y[j];
+  }
+  double tx = 0, ty = 0; for (double v : sx) tx += v; for (double v : sy) ty += v;
+  for (int i = 0; i < m; i++) X[i] = sx[i] / tx;
+  for (int j = 0; j < n; j++) Y[j] = sy[j] / ty;
+  double v = 0;
+  for (int i = 0; i < m; i++) for (int j = 0; j < n; j++) v += X[i] * A[(size_t)i * n + j] * Y[j];
+  *val = v;
+}
+
+// Solve many matrix games given as one flat value vector and shapes.
+static py::list nashBatch(py::array_t<float, py::array::c_style | py::array::forcecast> flat,
+                          const std::vector<std::pair<int,int>>& shapes, int iters, int threads) {
+  size_t G = shapes.size();
+  std::vector<size_t> off(G + 1, 0);
+  for (size_t k = 0; k < G; k++) off[k + 1] = off[k] + (size_t)shapes[k].first * shapes[k].second;
+  if ((size_t)flat.size() != off[G]) throw std::runtime_error("nash_batch size mismatch");
+  const float* f = flat.data();
+  std::vector<std::vector<double>> X(G), Y(G);
+  std::vector<double> V(G);
+  {
+    py::gil_scoped_release nogil;
+    std::atomic<size_t> next(0);
+    auto work = [&]() {
+      std::vector<double> A;
+      for (size_t k; (k = next.fetch_add(1)) < G;) {
+        int m = shapes[k].first, n = shapes[k].second;
+        A.assign(f + off[k], f + off[k + 1]);
+        X[k].resize(m); Y[k].resize(n);
+        nashCore(A.data(), m, n, iters, X[k].data(), Y[k].data(), &V[k]);
+      }
+    };
+    int nt = std::max(1, std::min<int>(threads, (int)G));
+    std::vector<std::thread> pool;
+    for (int t = 1; t < nt; t++) pool.emplace_back(work);
+    work();
+    for (auto& t : pool) t.join();
+  }
+  py::list out;
+  for (size_t k = 0; k < G; k++) {
+    py::array_t<double> x(X[k].size()), y(Y[k].size());
+    std::copy(X[k].begin(), X[k].end(), x.mutable_data());
+    std::copy(Y[k].begin(), Y[k].end(), y.mutable_data());
+    out.append(py::make_tuple(x, y, V[k]));
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------- heuristics
@@ -394,7 +544,11 @@ PYBIND11_MODULE(hcengine, m) {
   m.def("features", &features);
   m.def("policy_index", &policyIndex);
   m.def("policy_indices", &policyIndices);
-  m.def("successors", &successors, py::arg("game"), py::arg("mode"), py::arg("white"), py::arg("black"), py::arg("features") = true);
+  m.attr("NCOMPACT") = NCOMPACT;
+  m.def("compact", &compact);
+  m.def("successors", &successors);
+  m.def("successors_batch", &successorsBatch, py::arg("games"), py::arg("modes"), py::arg("white"), py::arg("black"), py::arg("threads") = 4);
+  m.def("nash_batch", &nashBatch, py::arg("values"), py::arg("shapes"), py::arg("iters") = 800, py::arg("threads") = 4);
   m.def("solve_nash", &solveNash, py::arg("M"), py::arg("iters") = 1000);
   m.def("computer_move", &computerMove, py::arg("game"), py::arg("color"), py::arg("hard") = false, py::arg("allowed") = std::vector<int>{});
   m.def("heuristic_values", &heuristicValues);

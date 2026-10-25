@@ -1,0 +1,195 @@
+"""Batched depth-1 simultaneous-move matrix search driven by the network.
+
+For each position: the root network pass gives move priors for both sides;
+we keep the most promising (plus tactical) candidate actions per side, run
+every joint action through the C++ engine, value the successors with the
+network (exact values for finished games), and solve the resulting zero-sum
+matrix game. The Nash strategies are both the move distribution to play and
+the policy training targets.
+"""
+import os
+import numpy as np
+import torch
+import hcengine as hc
+import model
+
+THREADS = int(os.environ.get('HC_THREADS', os.cpu_count() or 4))
+
+WHITE, BLACK = 0, 1
+
+
+class Evaluator:
+    def __init__(self, net, device='cpu', half=None, chunk=4096):
+        self.net = net.to(device).eval()
+        self.device = torch.device(device)
+        self.half = (self.device.type == 'cuda') if half is None else half
+        self.chunk = chunk
+
+    # inputs are compact uint8 encodings [N, 80]
+    @torch.no_grad()
+    def root(self, comp):
+        x = model.expand(torch.from_numpy(np.ascontiguousarray(comp)).to(self.device))
+        with torch.autocast(self.device.type, dtype=torch.float16, enabled=self.half):
+            p, v = self.net(x)
+        return p.float().cpu().numpy(), v.float().cpu().numpy()
+
+    @torch.no_grad()
+    def values(self, comp):
+        out = np.empty(len(comp), dtype=np.float32)
+        for i in range(0, len(comp), self.chunk):
+            x = model.expand(torch.from_numpy(np.ascontiguousarray(comp[i:i + self.chunk])).to(self.device))
+            with torch.autocast(self.device.type, dtype=torch.float16, enabled=self.half):
+                out[i:i + self.chunk] = self.net.value(x).float().cpu().numpy()
+        return out
+
+
+class HeuristicEvaluator:
+    """Stand-in evaluator used to bootstrap: uniform priors, material values."""
+    def __init__(self, scale=3000.0):
+        self.scale = scale
+
+
+def softmax_prior(logits, codes, flip=False):
+    if not codes or codes == [-1]:
+        return {}
+    idx = hc.policy_indices(codes, flip)
+    z = logits[idx]
+    z = np.exp(z - z.max())
+    z /= z.sum()
+    return dict(zip(codes, z))
+
+
+def tactical(game, color):
+    """Moves that hit the enemy king's square or its flight squares, and all
+    own king moves: king hunts and escapes must never be pruned."""
+    b = game.board()
+    me, them = ('w', 'b') if color == WHITE else ('b', 'w')
+    ek = [i for i, p in enumerate(b) if p[0] == them and p[1] == 'k']
+    zone = set()
+    for k in ek:
+        r, c = divmod(k, 8)
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if 0 <= r + dr < 8 and 0 <= c + dc < 8:
+                    zone.add((r + dr) * 8 + c + dc)
+    out = []
+    for m in game.legal(color):
+        frm, to = m & 63, (m >> 6) & 63
+        if to in zone or b[frm][1] == 'k':
+            out.append(m)
+    return out
+
+
+class Searcher:
+    def __init__(self, evaluator, k1=24, k_single=12, k_pairs=36, nash_iters=800,
+                 noise=0.0, noise_alpha=0.3, rng=None, heuristic=None):
+        self.ev = evaluator
+        self.k1, self.k_single, self.k_pairs = k1, k_single, k_pairs
+        self.nash_iters = nash_iters
+        self.noise, self.noise_alpha = noise, noise_alpha
+        self.rng = rng or np.random.default_rng()
+        self.heuristic = heuristic  # if set (scale), ignore the net: uniform priors, material values
+
+    def _noisy(self, prior):
+        if not self.noise or len(prior) < 2:
+            return prior
+        d = self.rng.dirichlet([self.noise_alpha] * len(prior))
+        return {m: (1 - self.noise) * p + self.noise * n for (m, p), n in zip(prior.items(), d)}
+
+    def _singles(self, game, color, prior, k):
+        moves = game.legal(color)
+        if not moves:
+            return [-1]
+        if len(moves) <= k:
+            return moves
+        top = sorted(moves, key=lambda m: -prior.get(m, 0.0))[:k]
+        extra = [m for m in tactical(game, color) if m not in top]
+        return top + extra
+
+    def _pairs(self, game, color, prior, reserved=None):
+        if reserved is not None:
+            moves = game.team_legal(color, reserved)
+            if not moves:
+                return [(reserved, -1)]
+            if len(moves) > self.k1:
+                top = sorted(moves, key=lambda m: -prior.get(m, 0.0))[:self.k1]
+                moves = top + [m for m in tactical(game, color) if m in moves and m not in top]
+            return [(reserved, m) for m in moves]
+        acts = game.team_actions(color)
+        if len(acts) <= self.k_pairs:
+            return [tuple(a) for a in acts]
+        p = lambda m: prior.get(m, 0.0) if m >= 0 else 0.0
+        singles = sorted({m for a in acts for m in a if m >= 0}, key=lambda m: -p(m))
+        keep = set(singles[:self.k_single])
+        tact = [m for m in tactical(game, color) if m not in keep]
+        pool = [tuple(a) for a in acts if a[0] in keep and (a[1] in keep or a[1] < 0)]
+        score = lambda a: (p(a[0]) + 1e-4) * ((p(a[1]) + 1e-4) if a[1] >= 0 else 1e-4)
+        pool.sort(key=lambda a: -score(a))
+        chosen = pool[:self.k_pairs]
+        have = {m for a in chosen for m in a}
+        # make sure each tactical move appears, paired with its best partner
+        for t in tact[:12]:
+            if t in have:
+                continue
+            partners = [a for a in acts if t in a]
+            if partners:
+                best = max(partners, key=score)
+                chosen.append(tuple(best))
+                have.update(best)
+        return chosen or [tuple(a) for a in acts[:self.k_pairs]]
+
+    def run(self, items):
+        """items: list of (game, mode, reserved_color, reserved_code). Returns a
+        list of dicts with wa, ba, x, y, v, root_v, pw, pb (priors)."""
+        n = len(items)
+        if self.heuristic is None:
+            feats = np.stack([hc.compact(g, mode) for g, mode, _, _ in items])
+            logits, root_v = self.ev.root(feats)
+        else:
+            logits, root_v = None, np.zeros(n, np.float32)
+        plans = []
+        for i, (g, mode, rc, rcode) in enumerate(items):
+            wl, bl = g.legal(WHITE), g.legal(BLACK)
+            if logits is None:
+                pw = {m: 1.0 / len(wl) for m in wl}
+                pb = {m: 1.0 / len(bl) for m in bl}
+            else:
+                pw = softmax_prior(logits[i, 0], wl)
+                pb = softmax_prior(logits[i, 1], bl)
+            spw, spb = self._noisy(pw), self._noisy(pb)
+            if mode == 0:
+                wa = [(m, -1) for m in self._singles(g, WHITE, spw, self.k1)]
+                ba = [(m, -1) for m in self._singles(g, BLACK, spb, self.k1)]
+            else:
+                wa = self._pairs(g, WHITE, spw, rcode if rc == WHITE else None)
+                ba = self._pairs(g, BLACK, spb, rcode if rc == BLACK else None)
+            plans.append((wa, ba, pw, pb))
+        # successor values
+        if self.heuristic is None:
+            comp, res = hc.successors_batch([it[0] for it in items], [it[1] for it in items],
+                                            [p[0] for p in plans], [p[1] for p in plans], THREADS)
+            vals = np.zeros(len(res), np.float32)
+            live = np.nonzero(res == 0)[0]
+            if len(live):
+                vals[live] = self.ev.values(comp[live])
+            vals[res == 1], vals[res == 2], vals[res == 3] = 1.0, -1.0, 0.0
+        else:
+            vals = np.concatenate([hc.heuristic_values(g, mode, wa, ba, self.heuristic) for (g, mode, _, _), (wa, ba, _, _) in zip(items, plans)])
+        shapes = [(len(p[0]), len(p[1])) for p in plans]
+        sols = hc.nash_batch(vals, shapes, self.nash_iters, THREADS)
+        offs = np.cumsum([0] + [a * b for a, b in shapes])
+        out = []
+        for i, ((wa, ba, pw, pb), (x, y, v)) in enumerate(zip(plans, sols)):
+            M = vals[offs[i]:offs[i + 1]].reshape(len(wa), len(ba))
+            out.append(dict(wa=wa, ba=ba, x=x, y=y, v=v, root_v=float(root_v[i]), pw=pw, pb=pb, M=M))
+        return out
+
+
+def marginal(acts, probs):
+    """Per-move marginal of a (team) mixed strategy; sums to 1."""
+    d = {}
+    for (a, b), p in zip(acts, probs):
+        mv = [m for m in (a, b) if m >= 0]
+        for m in mv:
+            d[m] = d.get(m, 0.0) + p / len(mv)
+    return d
