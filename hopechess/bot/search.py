@@ -82,13 +82,14 @@ def tactical(game, color):
 
 class Searcher:
     def __init__(self, evaluator, k1=24, k_single=12, k_pairs=36, nash_iters=800,
-                 noise=0.0, noise_alpha=0.3, rng=None, heuristic=None):
+                 noise=0.0, noise_alpha=0.3, rng=None, heuristic=None, deepen=0):
         self.ev = evaluator
         self.k1, self.k_single, self.k_pairs = k1, k_single, k_pairs
         self.nash_iters = nash_iters
         self.noise, self.noise_alpha = noise, noise_alpha
         self.rng = rng or np.random.default_rng()
         self.heuristic = heuristic  # if set (scale), ignore the net: uniform priors, material values
+        self.deepen = deepen        # >0: re-search this many likely joint actions one round deeper
 
     def _noisy(self, prior):
         if not self.noise or len(prior) < 2:
@@ -175,14 +176,56 @@ class Searcher:
             vals[res == 1], vals[res == 2], vals[res == 3] = 1.0, -1.0, 0.0
         else:
             vals = np.concatenate([hc.heuristic_values(g, mode, wa, ba, self.heuristic) for (g, mode, _, _), (wa, ba, _, _) in zip(items, plans)])
+        if self.heuristic is not None:
+            res = np.zeros(len(vals), np.int8)
         shapes = [(len(p[0]), len(p[1])) for p in plans]
         sols = hc.nash_batch(vals, shapes, self.nash_iters, THREADS)
         offs = np.cumsum([0] + [a * b for a, b in shapes])
         out = []
         for i, ((wa, ba, pw, pb), (x, y, v)) in enumerate(zip(plans, sols)):
             M = vals[offs[i]:offs[i + 1]].reshape(len(wa), len(ba))
-            out.append(dict(wa=wa, ba=ba, x=x, y=y, v=v, root_v=float(root_v[i]), pw=pw, pb=pb, M=M))
+            R = res[offs[i]:offs[i + 1]].reshape(len(wa), len(ba))
+            out.append(dict(wa=wa, ba=ba, x=x, y=y, v=v, root_v=float(root_v[i]), pw=pw, pb=pb, M=M, R=R))
+        if self.deepen and self.heuristic is None:
+            self._deepen(items, out)
         return out
+
+    def _deepen(self, items, out):
+        """Selective depth 2: replace the values of the most relevant joint
+        actions (likely under both Nash strategies, plus best responses to our
+        main candidates) by a depth-1 search from the child position."""
+        child_items, where = [], []
+        for i, ((g, mode, _, _), r) in enumerate(zip(items, out)):
+            x, y, M, R = r['x'], r['y'], r['M'], r['R']
+            cells = set()
+            prob = np.outer(x, y)
+            for k in np.argsort(-prob, axis=None)[:self.deepen]:
+                cells.add(divmod(int(k), M.shape[1]))
+            for a in np.argsort(-x)[:4]:
+                cells.add((int(a), int(np.argmin(M[a]))))
+            for b in np.argsort(-y)[:4]:
+                cells.add((int(np.argmax(M[:, b])), int(b)))
+            for a, b in cells:
+                if R[a, b] != 0:
+                    continue
+                wa, ba = r['wa'][a], r['ba'][b]
+                child = g.play(wa[0], ba[0]) if mode == 0 else g.play2(wa[0], wa[1], ba[0], ba[1])
+                child_items.append((child, mode, None, None))
+                where.append((i, a, b))
+        if not child_items:
+            return
+        sub = Searcher(self.ev, self.k1, self.k_single, self.k_pairs, self.nash_iters, rng=self.rng)
+        res = []
+        for j in range(0, len(child_items), 64):
+            res += sub.run(child_items[j:j + 64])
+        touched = set()
+        for (i, a, b), cr in zip(where, res):
+            out[i]['M'] = out[i]['M'].copy() if i not in touched else out[i]['M']
+            out[i]['M'][a, b] = cr['v']
+            touched.add(i)
+        for i in touched:
+            x, y, v = hc.solve_nash(out[i]['M'].astype(np.float64), self.nash_iters)
+            out[i].update(x=x, y=y, v=v)
 
 
 def marginal(acts, probs):
