@@ -10,7 +10,7 @@ import argparse, base64, io, json, os, tarfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 BOT = os.path.dirname(HERE)
 FILES = ['build.sh', 'cpp/engine.hpp', 'cpp/engine.cpp', 'cpp/hcpy.cpp', 'model.py', 'search.py',
-         'agents.py', 'netagent.py', 'train.py', 'arena.py']
+         'agents.py', 'netagent.py', 'train.py', 'arena.py', 'evaluate.py']
 
 
 def pack():
@@ -36,6 +36,7 @@ def main():
     ap.add_argument('--args', default='--hours 1')
     ap.add_argument('--source', action='append', default=[], help='kernel whose output to mount (owner/slug)')
     ap.add_argument('--init-file', default=None, help='checkpoint filename inside the mounted source output')
+    ap.add_argument('--cmd', default=None, help='custom command instead of train.py; @slug/file resolves to a mounted kernel output file')
     o = ap.parse_args()
     blob = pack()
     init = ''
@@ -61,8 +62,17 @@ INIT = ('--init ' + cands[0]) if cands else ''
              "print(subprocess.run('bash build.sh', shell=True, capture_output=True, text=True))\n"
              "print(subprocess.run('nvidia-smi; nproc; free -g', shell=True, capture_output=True, text=True).stdout)\n"),
         cell(init),
-        cell("cmd = f'python3 -u train.py --out /kaggle/working/run {INIT} " + o.args + "'\n"
-             "print(cmd)\n"
+        cell(("cmd = f'python3 -u train.py --out /kaggle/working/run {INIT} " + o.args + "'\n") if not o.cmd else
+             ("import glob, re\n"
+              f"cmd = {o.cmd!r}\n"
+              "def _res(m):\n"
+              "    slug, f = m.group(1), m.group(2)\n"
+              "    c = [p for p in glob.glob('/kaggle/input/**/' + f, recursive=True) if '/' + slug + '/' in p]\n"
+              "    print('resolve', m.group(0), c)\n"
+              "    return c[0]\n"
+              "cmd = re.sub(r'@([\\w-]+)/([\\w./-]+)', _res, cmd)\n"
+              "os.makedirs('/kaggle/working/run', exist_ok=True)\n")
+             + "print(cmd)\n"
              "p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)\n"
              "with open('/kaggle/working/train.log', 'w') as log:\n"
              "    for line in p.stdout:\n"

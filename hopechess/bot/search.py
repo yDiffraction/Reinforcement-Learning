@@ -19,28 +19,57 @@ WHITE, BLACK = 0, 1
 
 
 class Evaluator:
-    def __init__(self, net, device='cpu', half=None, chunk=4096):
+    """Batched network evaluation. With several CUDA devices the successor
+    batches are spread over replicas (call sync() after training)."""
+    def __init__(self, net, device='cpu', half=None, chunk=4096, devices=None):
+        import copy, time
         self.net = net.to(device).eval()
         self.device = torch.device(device)
         self.half = (self.device.type == 'cuda') if half is None else half
         self.chunk = chunk
+        self.devices = [torch.device(d) for d in (devices or [device])]
+        self.replicas = [self.net] + [copy.deepcopy(self.net).to(d).eval() for d in self.devices[1:]]
+        self.t_root = self.t_values = 0.0
+        self.n_values = 0
+        self._time = time.time
+
+    def sync(self):
+        sd = self.net.state_dict()
+        for r in self.replicas[1:]:
+            r.load_state_dict(sd)
+            r.eval()
+
+    def _to(self, arr, dev):
+        t = torch.from_numpy(np.ascontiguousarray(arr))
+        if dev.type == 'cuda':
+            t = t.pin_memory().to(dev, non_blocking=True)
+        return model.expand(t)
 
     # inputs are compact uint8 encodings [N, 80]
     @torch.no_grad()
     def root(self, comp):
-        x = model.expand(torch.from_numpy(np.ascontiguousarray(comp)).to(self.device))
+        t = self._time()
+        x = self._to(comp, self.device)
         with torch.autocast(self.device.type, dtype=torch.float16, enabled=self.half):
             p, v = self.net(x)
-        return p.float().cpu().numpy(), v.float().cpu().numpy()
+        out = p.float().cpu().numpy(), v.float().cpu().numpy()
+        self.t_root += self._time() - t
+        return out
 
     @torch.no_grad()
     def values(self, comp):
-        out = np.empty(len(comp), dtype=np.float32)
-        for i in range(0, len(comp), self.chunk):
-            x = model.expand(torch.from_numpy(np.ascontiguousarray(comp[i:i + self.chunk])).to(self.device))
-            with torch.autocast(self.device.type, dtype=torch.float16, enabled=self.half):
-                out[i:i + self.chunk] = self.net.value(x).float().cpu().numpy()
-        return out
+        t = self._time()
+        outs = []
+        nd = len(self.devices)
+        for k, i in enumerate(range(0, len(comp), self.chunk)):
+            dev, net = self.devices[k % nd], self.replicas[k % nd]
+            x = self._to(comp[i:i + self.chunk], dev)
+            with torch.autocast(dev.type, dtype=torch.float16, enabled=self.half):
+                outs.append(net.value(x).float())
+        res = np.concatenate([o.cpu().numpy() for o in outs]) if outs else np.zeros(0, np.float32)
+        self.t_values += self._time() - t
+        self.n_values += len(comp)
+        return res
 
 
 class HeuristicEvaluator:

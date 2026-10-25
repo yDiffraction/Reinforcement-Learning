@@ -187,6 +187,7 @@ def main():
     ap.add_argument('--eval-every', type=int, default=3)
     ap.add_argument('--eval-games', type=int, default=40)
     ap.add_argument('--seed', type=int, default=0)
+    ap.add_argument('--gpus', type=int, default=0, help='max devices for inference (0 = all)')
     o = ap.parse_args()
     os.makedirs(o.out, exist_ok=True)
     rng = np.random.default_rng(o.seed)
@@ -203,7 +204,9 @@ def main():
     net.eval()
     opt = torch.optim.AdamW(net.parameters(), lr=o.lr, weight_decay=1e-4)
     buf = Replay(o.buffer)
-    ev = Evaluator(net, o.device)
+    devs = [f'cuda:{i}' for i in range(torch.cuda.device_count())] if o.device.startswith('cuda') else [o.device]
+    ev = Evaluator(net, o.device, devices=devs[:o.gpus] if o.gpus else devs)
+    print('devices', ev.devices, flush=True)
     kw = dict(k1=o.k1, k_single=o.k_single, k_pairs=o.k_pairs)
     sp_search = Searcher(ev, noise=o.noise, rng=rng, **kw)
     boot_search = Searcher(ev, rng=rng, heuristic=3000.0, **kw)
@@ -252,13 +255,17 @@ def main():
         steps = int(math.ceil(new * o.reuse / o.batch))
         if buf.n >= 4 * o.batch:
             losses = train_steps(net, opt, buf, steps, o.batch, dev, rng, o.lam)
+            ev.sync()
         else:
             losses = np.zeros(3)
         t_train = time.time() - ts
         lens = {m: float(np.mean([l for mm, l in stats['len'][-400:] if mm == m] or [0])) for m in (0, 1)}
         rec = dict(it=it, t=round(time.time() - t0), games=games_done, samples=total_samples, buf=buf.n,
                    loss=losses.round(4).tolist(), len1v1=lens[0], len2v2=lens[1], p2v2=round(p2v2_now(), 3),
-                   play_s=round(t_play), train_s=round(t_train), steps=steps, boot_left=max(boot_left, 0))
+                   play_s=round(t_play), train_s=round(t_train), steps=steps, boot_left=max(boot_left, 0),
+                   nn_root_s=round(ev.t_root), nn_val_s=round(ev.t_values), evals_per_s=round(ev.n_values / max(ev.t_values, 1e-9)))
+        ev.t_root = ev.t_values = 0.0
+        ev.n_values = 0
         if o.eval_every and it % o.eval_every == 0:
             ts = time.time()
             for mode in (0, 1):
