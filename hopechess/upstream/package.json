@@ -1,0 +1,12 @@
+{
+  "name": "hopechess",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test *.test.js",
+    "dev": "node server.mjs",
+    "start": "node server.mjs"
+  }
+}
