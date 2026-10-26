@@ -4,7 +4,7 @@
     python3 client.py --server http://localhost:4173 --create --mode 2v2 --color white
     # join an existing room (any open seat, or a team)
     python3 client.py --server http://localhost:4173 --room 0421 --color black
-Agent: --agent models/best.pt[:deepen=8] (default models/best.pt:deepen=8) | computer-hard | heur-nash | random
+Agent: --agent models/best.pt[:deepen=N] (default models/best.pt:deepen=16) | computer-hard | heur-nash | random
 
 The bot rebuilds the exact engine state by replaying the room's round
 history, so repetition counts and rest flags match the server. In 2v2 it
@@ -170,7 +170,8 @@ class Bot:
             searcher.deepen = self.max_deepen
             return
         per_move = left / 1000.0 / 60.0   # assume ~60 more rounds
-        searcher.deepen = self.max_deepen if per_move > 8 else (min(self.max_deepen, 4) if per_move > 3 else 0)
+        searcher.deepen = (self.max_deepen if per_move > 15 else min(self.max_deepen, 8) if per_move > 8
+                           else min(self.max_deepen, 4) if per_move > 3 else 0)
 
     def run(self):
         s = self.session
@@ -205,7 +206,7 @@ def main():
     ap.add_argument('--color', default='random')
     ap.add_argument('--minutes', type=int, default=None)
     ap.add_argument('--unrated', action='store_true')
-    ap.add_argument('--agent', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', 'best.pt') + ':deepen=8')
+    ap.add_argument('--agent', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', 'best.pt') + ':deepen=16')
     ap.add_argument('--no-rematch', action='store_true')
     ap.add_argument('--teammate', choices=['human', 'bot'], default='human',
                     help='2v2: human = wait for the teammate, else move robustly first; '

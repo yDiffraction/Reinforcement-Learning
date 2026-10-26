@@ -168,3 +168,35 @@ the bot, moving second), 100 games each:
   The client (a) waits a few seconds for a human teammate's order (`--wait`),
   then (b) moves first robustly if none came. With `--teammate bot` the primary
   seat moves first at once and the second seat waits for it.
+
+## 7. Round 2 (8 h on 2× T4, init from A, lr 5e-4, 85% 2v2) and evaluation 2
+
+Notebook `timsindelar/hopechess-rl-r2`: 81k games, 2.62M positions. Its
+in-training 2v2 score vs "hard" rose from 0.78 to ~0.92. 1v1 stayed at ~0.60,
+since it was only 15% of the data. Model: `bot/models/r2.pt` (= `best.pt`).
+
+Evaluation `timsindelar/hopechess-eval-2`, 200 games each (`bot/logs/eval2.jsonl`):
+
+| match | 2v2 | 1v1 |
+|---|---|---|
+| R2 vs R1 (A final) | **0.690 (+139 Elo)** | 0.590 (+63) |
+| R2 vs "hard" | 0.853 (+305) | 0.667 (+121) |
+| R2 + deepen 8 vs "hard" | **0.900 (+382)** | 0.677 (+129) |
+| R2 vs R2 at iteration 50 | 0.635 (+96) | 0.455 (−31) |
+| wider candidates (k1 28, 44 pairs) vs R2 (20/30) | 0.472 | 0.487 |
+| deepen 8 vs depth 1 | 0.570 (+49) | 0.728 (+171) |
+| deepen 24 vs deepen 8 | 0.555 (+38) | 0.547 (+33) |
+
+* 2v2 is still improving with more self-play (+96 Elo over the last ~40% of
+  round 2). 1v1 stalls at a low 1v1 share: it needs its own data, despite the
+  transfer seen in round 1.
+* More candidates per side do not help; the policy prior already ranks well.
+  Spending compute on depth does help.
+* Selective depth 2 keeps paying with more re-searched cells: 8 cells gain
+  +49/+171, and 24 cells gain another +38/+33. The client now uses up to 16 when
+  the clock allows (`--agent models/best.pt:deepen=16`, reduced automatically in
+  fast time controls).
+* Against the upstream "hard" computer, 1v1 has many draws (~19%). Its
+  deterministic shuffling forces repetitions that the bot does not avoid,
+  because a draw is worth 0 to the value net, the same as a balanced
+  position.
