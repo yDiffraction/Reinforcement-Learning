@@ -6,7 +6,7 @@ from search import Evaluator, Searcher, WHITE
 
 
 class NetAgent:
-    def __init__(self, net, device='cpu', temperature=1.0, seed=None, solo=0, **search_kw):
+    def __init__(self, net, device='cpu', temperature=1.0, seed=None, solo=0, beta=0.0, **search_kw):
         self.rng = np.random.default_rng(seed)
         self.searcher = Searcher(Evaluator(net, device), rng=self.rng, **search_kw)
         self.temperature = temperature
@@ -14,6 +14,7 @@ class NetAgent:
         # solo=1: when moving first in 2v2, assume an independent teammate
         # (value own moves by expectation over the teammate's likely replies)
         self.solo = solo
+        self.beta = beta
         self.last = None
 
     def pick(self, acts, probs):
@@ -26,7 +27,7 @@ class NetAgent:
 
     def act(self, game, color, mode, reserved=None):
         if mode == 1 and reserved is None and self.solo:
-            r = self.searcher.run_first_mover(game, color)
+            r = self.searcher.run_first_mover(game, color, beta=self.beta)
             self.last = r
             m = self.pick([(m,) for m in r['moves']], r['probs'])[0]
             allowed = game.team_legal(color, m) if m >= 0 else []
@@ -52,5 +53,5 @@ def from_spec(spec, seed=None, threads=1):
     kw = {}
     for kv in parts[1:]:
         k, v = kv.split('=')
-        kw[k] = float(v) if k in ('temperature', 'noise') else int(v)
+        kw[k] = float(v) if k in ('temperature', 'noise', 'beta') else int(v)
     return NetAgent(net, seed=seed, **kw)

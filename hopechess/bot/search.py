@@ -219,7 +219,7 @@ class Searcher:
             self._deepen(items, out)
         return out
 
-    def run_first_mover(self, game, color, k_mine=10, k_mate=10):
+    def run_first_mover(self, game, color, k_mine=10, k_mate=10, beta=0.0):
         """2v2 seat that submits before an unknown teammate (human, other bot).
         Each own move a is valued by the expectation over the teammate's reply
         b ~ policy prior (restricted to moves compatible with a), against the
@@ -258,6 +258,17 @@ class Searcher:
         vals[res == 1], vals[res == 2], vals[res == 3] = 1.0, -1.0, 0.0
         M = vals.reshape(len(wa), len(ba))
         M = M if color == WHITE else -M.T          # rows: my pairs, my point of view
+        if beta:
+            # quantal-response teammate: prefers replies that work well with a
+            # (against the opponent's Nash strategy of the full pair game)
+            _, yo, _ = hc.solve_nash(M.astype(np.float64), self.nash_iters // 2)
+            q = M @ yo
+            weight = np.array(weight)
+            for a in singles:
+                rows = [r for r, o in enumerate(owner) if o == a]
+                z = np.log(weight[rows]) + beta * (q[rows] - q[rows].max())
+                z = np.exp(z - z.max())
+                weight[rows] = z / z.sum()
         idx = {a: i for i, a in enumerate(singles)}
         R = np.zeros((len(singles), M.shape[1]))
         for r, (a, w) in enumerate(zip(owner, weight)):
