@@ -64,7 +64,7 @@ INIT = ('--init ' + cands[0]) if cands else ''
              "print(subprocess.run('nvidia-smi; nproc; free -g', shell=True, capture_output=True, text=True).stdout)\n"
 ),
         cell(init),
-        cell(("cmd = f'python3 -u train.py --out /kaggle/working/run {INIT} " + o.args + "'\n") if not o.cmd else
+        cell((("cmd = f'python3 -u train.py --out /kaggle/working/run {INIT} " + o.args + "'\n") if not o.cmd else
              ("import glob, re\n"
               f"cmd = {o.cmd!r}\n"
               "def _res(m):\n"
@@ -73,7 +73,7 @@ INIT = ('--init ' + cands[0]) if cands else ''
               "    print('resolve', m.group(0), c)\n"
               "    return c[0]\n"
               "cmd = re.sub(r'@([\\w-]+)/([\\w./-]+)', _res, cmd)\n"
-              "os.makedirs('/kaggle/working/run', exist_ok=True)\n")
+              "os.makedirs('/kaggle/working/run', exist_ok=True)\n"))
              + "print(cmd)\n"
              "p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)\n"
              "with open('/kaggle/working/train.log', 'w') as log:\n"
