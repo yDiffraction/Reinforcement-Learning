@@ -139,7 +139,8 @@ the bot, moving second), 100 games each:
 | bot's first move | score |
 |---|---|
 | team plan (its half of a sampled Nash pair) | 0.665 |
-| robust, expectation over policy prior, sampled | **0.755** |
+| robust, expectation over policy prior, sampled | 0.755 |
+| robust, expectation over policy prior, **argmax** | **0.800** |
 | robust, quantal-response teammate (β=10) | 0.570 |
 
 * Moving **second** with the teammate's order known is strong. Moving **first**
@@ -158,10 +159,12 @@ the bot, moving second), 100 games each:
 * The control (team plan + argmax: 0.340) shows that the gain comes from the
   robust valuation combined with argmax, not from argmax alone.
 * Even when the teammate does react to the reservation, the robust first move
-  (0.755) beats playing half of the team plan (0.665). The quantal-response
+  beats playing half of the team plan: 0.800 (argmax) and 0.755 (sampled),
+  against 0.665. The quantal-response
   model that assumes the teammate will cover is too optimistic (0.570).
-* The client therefore (a) waits a few seconds for a human teammate's order
-  (`--wait`) and complements it, and (b) only then moves first with the robust
-  search. With `--teammate bot` (two bot clients on one team) the primary seat
-  plays its half of the team plan at once and the second seat complements it.
-  That second seat effectively reproduces full team play.
+* **Conclusion: whenever the bot submits first in 2v2, it plays the argmax of
+  the robust single-move game. Whenever it submits second, it plays the best
+  complement to its teammate's order.** This holds for every teammate tested.
+  The client (a) waits a few seconds for a human teammate's order (`--wait`),
+  then (b) moves first robustly if none came. With `--teammate bot` the primary
+  seat moves first at once and the second seat waits for it.

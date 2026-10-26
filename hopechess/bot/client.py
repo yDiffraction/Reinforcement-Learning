@@ -12,7 +12,7 @@ reads its teammate's pending order (shared within a team) and plays the best
 complementary move. With a human teammate (default) it first waits --wait
 seconds for that order; if none comes it moves first with a move that is
 robust to the teammate's likely replies. With --teammate bot (two bot
-clients on one team) the primary seat moves at once with the team plan and
+clients on one team) the primary seat moves at once and
 the second seat complements it.
 """
 import argparse, json, os, sys, threading, time, urllib.error, urllib.parse, urllib.request
@@ -133,7 +133,8 @@ class Bot:
                         self.timers[key].daemon = True
                         self.timers[key].start()
                     return
-                solo = self.teammate == 'human' or not primary
+                # moving first: robust deterministic move (FINDINGS.md section 6)
+                solo = True
             if self.think_delay:
                 time.sleep(self.think_delay)
             t = time.time()
@@ -208,7 +209,7 @@ def main():
     ap.add_argument('--no-rematch', action='store_true')
     ap.add_argument('--teammate', choices=['human', 'bot'], default='human',
                     help='2v2: human = wait for the teammate, else move robustly first; '
-                         'bot = primary seat moves at once with the team plan, the other seat complements it')
+                         'bot = primary seat moves at once, the other seat complements it')
     ap.add_argument('--wait', type=float, default=6.0, help='2v2: seconds to wait for the teammate before moving')
     ap.add_argument('--quiet', action='store_true')
     o = ap.parse_args()
