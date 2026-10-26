@@ -6,7 +6,7 @@ from search import Evaluator, Searcher, WHITE
 
 
 class NetAgent:
-    def __init__(self, net, device='cpu', temperature=1.0, seed=None, solo=0, beta=0.0, **search_kw):
+    def __init__(self, net, device='cpu', temperature=1.0, seed=None, solo=0, beta=0.0, solo_temperature=0.0, **search_kw):
         self.rng = np.random.default_rng(seed)
         self.searcher = Searcher(Evaluator(net, device), rng=self.rng, **search_kw)
         self.temperature = temperature
@@ -15,13 +15,17 @@ class NetAgent:
         # (value own moves by expectation over the teammate's likely replies)
         self.solo = solo
         self.beta = beta
+        # A lone first mover should not randomize: the Nash mix is meant for a
+        # jointly randomized team pair (see FINDINGS.md section 6).
+        self.solo_temperature = solo_temperature
         self.last = None
 
-    def pick(self, acts, probs):
+    def pick(self, acts, probs, temperature=None):
+        t = self.temperature if temperature is None else temperature
         probs = np.maximum(np.asarray(probs, np.float64), 0)
-        if self.temperature <= 0:
+        if t <= 0:
             return acts[int(np.argmax(probs))]
-        p = probs ** (1.0 / self.temperature)
+        p = probs ** (1.0 / t)
         p /= p.sum()
         return acts[self.rng.choice(len(acts), p=p)]
 
@@ -29,7 +33,7 @@ class NetAgent:
         if mode == 1 and reserved is None and self.solo:
             r = self.searcher.run_first_mover(game, color, beta=self.beta)
             self.last = r
-            m = self.pick([(m,) for m in r['moves']], r['probs'])[0]
+            m = self.pick([(m,) for m in r['moves']], r['probs'], self.solo_temperature)[0]
             allowed = game.team_legal(color, m) if m >= 0 else []
             # second element only matters if the caller controls both seats
             b = max(allowed, key=lambda c: 0) if allowed else -1
@@ -53,5 +57,5 @@ def from_spec(spec, seed=None, threads=1):
     kw = {}
     for kv in parts[1:]:
         k, v = kv.split('=')
-        kw[k] = float(v) if k in ('temperature', 'noise', 'beta') else int(v)
+        kw[k] = float(v) if k in ('temperature', 'noise', 'beta', 'solo_temperature') else int(v)
     return NetAgent(net, seed=seed, **kw)

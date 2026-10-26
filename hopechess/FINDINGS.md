@@ -129,6 +129,16 @@ bot + upstream "hard" computer vs a team of two "hard" computers (local arena,
 | bot always first | team plan (plays its half of a Nash pair) | 0.342 |
 | bot always second | best complement to the teammate's reserved order | **0.633** |
 | bot always first | expectation over teammate replies ~ policy prior | 0.317 |
+| bot always first | same, quantal-response teammate (β=10), 100 games | 0.225 |
+| bot always first | same as prior-expectation but **argmax instead of sampling**, 100 games | **0.565** |
+
+With a teammate that *does* react to the reservation (an earlier checkpoint of
+the bot, moving second), 100 games each:
+
+| bot's first move | score |
+|---|---|
+| team plan (its half of a sampled Nash pair) | **0.665** |
+| robust, quantal-response teammate (β=10) | 0.570 |
 
 * Moving **second** with the teammate's order known is strong. Moving **first**
   with the team plan is harmful when the teammate does not complete the plan:
@@ -137,6 +147,14 @@ bot + upstream "hard" computer vs a team of two "hard" computers (local arena,
 * The upstream computer ignores the reserved order completely: it scores its
   move as if it were the only mover. So it is a pessimistic stand-in for a
   human, who sees the bot's preview and reacts to it.
+* **A lone first mover must not randomize.** Sampling from the mixed
+  strategy is right when the whole team's pair is randomized jointly. A single
+  sampled half-move next to an independent teammate is often a "bluff" that
+  only works with its planned partner. Taking the argmax of the robust
+  single-move game turned 0.32 into 0.57 next to the upstream computer.
+  The agent now uses argmax for robust first moves (`solo_temperature=0`).
+* When the teammate reacts to the reservation, as a human or a second bot
+  client does, the team plan works well (0.665).
 * The client therefore (a) waits a few seconds for a human teammate's order
   (`--wait`) and complements it, and (b) only then moves first with the robust
   search. With `--teammate bot` (two bot clients on one team) the primary seat
