@@ -4,7 +4,7 @@
     python3 client.py --server http://localhost:4173 --create --mode 2v2 --color white
     # join an existing room (any open seat, or a team)
     python3 client.py --server http://localhost:4173 --room 0421 --color black
-Agent: --agent net:models/best.pt (default) | computer-hard | heur-nash | random
+Agent: --agent models/best.pt[:deepen=8] (default models/best.pt:deepen=8) | computer-hard | heur-nash | random
 
 The bot rebuilds the exact engine state by replaying the room's round
 history, so repetition counts and rest flags match the server. In 2v2 it
@@ -58,6 +58,7 @@ class Bot:
         self.done_for = set()
         self.rematched = set()
         self.lock = threading.Lock()
+        self.max_deepen = None
 
     def req(self, path, body=None):
         data = None if body is None else json.dumps(body).encode()
@@ -114,6 +115,7 @@ class Bot:
             if self.think_delay:
                 time.sleep(self.think_delay)
             t = time.time()
+            self.budget(snap)
             if mode == 0:
                 move = self.agent.act(g, color, 0)[0]
             elif reserved is not None:
@@ -129,6 +131,21 @@ class Bot:
             except RuntimeError as e:
                 print('move rejected:', e, flush=True)
                 self.done_for.discard(key)
+
+    def budget(self, snap):
+        """Use the selective depth-2 search only when the clock allows it."""
+        searcher = getattr(self.agent, 'searcher', None)
+        if searcher is None:
+            return
+        if self.max_deepen is None:
+            self.max_deepen = searcher.deepen
+        clock = snap.get('clock') or {}
+        left = (clock.get('remainingMs') or {}).get(snap['you'])
+        if clock.get('limitMinutes') is None or left is None:
+            searcher.deepen = self.max_deepen
+            return
+        per_move = left / 1000.0 / 60.0   # assume ~60 more rounds
+        searcher.deepen = self.max_deepen if per_move > 8 else (min(self.max_deepen, 4) if per_move > 3 else 0)
 
     def run(self):
         s = self.session
@@ -163,12 +180,12 @@ def main():
     ap.add_argument('--color', default='random')
     ap.add_argument('--minutes', type=int, default=None)
     ap.add_argument('--unrated', action='store_true')
-    ap.add_argument('--agent', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', 'best.pt'))
+    ap.add_argument('--agent', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', 'best.pt') + ':deepen=8')
     ap.add_argument('--no-rematch', action='store_true')
     ap.add_argument('--quiet', action='store_true')
     o = ap.parse_args()
-    spec = o.agent if (':' in o.agent or not o.agent.endswith('.pt')) else 'net:' + o.agent
-    bot = Bot(o.server, make_agent(spec), verbose=not o.quiet, rematch=not o.no_rematch)
+    spec = 'net:' + o.agent if ('.pt' in o.agent and not o.agent.startswith('net:')) else o.agent
+    bot = Bot(o.server, make_agent(spec, threads=os.cpu_count() or 4), verbose=not o.quiet, rematch=not o.no_rematch)
     if o.create:
         bot.create(o.mode, o.color if o.color != 'random' else 'white', o.minutes, not o.unrated)
     else:

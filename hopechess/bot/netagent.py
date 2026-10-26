@@ -33,10 +33,10 @@ class NetAgent:
         return [a[0], a[1]]
 
 
-def from_spec(spec, seed=None):
-    """'path.pt[:k1=24][:temperature=0.5]...'"""
+def from_spec(spec, seed=None, threads=1):
+    """'path.pt[:k1=24][:deepen=8][:temperature=0.5]...'"""
     parts = spec.split(':')
-    torch.set_num_threads(1)
+    torch.set_num_threads(threads)
     net, _ = model.load(parts[0])
     kw = {}
     for kv in parts[1:]:

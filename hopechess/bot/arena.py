@@ -10,7 +10,7 @@ import hcengine as hc
 import agents as A
 
 
-def make_agent(spec, seed=None):
+def make_agent(spec, seed=None, threads=1):
     if spec == 'random':
         return A.RandomAgent(seed)
     if spec in ('computer-normal', 'computer-hard'):
@@ -20,7 +20,7 @@ def make_agent(spec, seed=None):
         return A.HeuristicNashAgent(seed=seed, **{k: float(v) if k in ('scale', 'temperature') else int(v) for k, v in kw.items()})
     if spec.startswith('net:'):
         import netagent
-        return netagent.from_spec(spec[4:], seed=seed)
+        return netagent.from_spec(spec[4:], seed=seed, threads=threads)
     raise ValueError(spec)
 
 
