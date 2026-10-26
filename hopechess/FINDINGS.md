@@ -226,8 +226,9 @@ Evaluation `timsindelar/hopechess-eval-3`, 300 games each (`bot/logs/eval3.jsonl
 
 * Final bot: `bot/models/best.pt` (8×80 SE-ResNet, ~1.6M parameters, one net
   for 1v1 and 2v2). It runs a depth-1 Nash matrix search over policy-pruned
-  candidates, plus selective depth-2 when time allows. Total training was
-  ~19 GPU-hours on Kaggle 2×T4 (≈7.2M self-play positions, 204k games).
+  candidates, plus selective depth-2 when time allows. Its lineage A → R2 → R3
+  trained for ~18.5 h on Kaggle 2×T4: 7.2M self-play positions from 203k games.
+  Including run B and the evaluations, ~29 GPU-hours were used.
 * Against the game's own "hard" computer it scores **92% in 2v2** and **79% in
   1v1** with the default client search.
 * What mattered most, in order:
