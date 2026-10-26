@@ -89,6 +89,56 @@ Observations:
   half almost only on 1v1 and was already at 0.44–0.71 in 2v2 when the 2v2
   share was only 20–40%. Both modes share one network with a mode flag.
 * The 1v1 curriculum did not hurt 2v2 and gives more positions per GPU hour.
-  We continue from A (head-to-head A vs B pending).
 * Many 1v1 games against "hard" are draws (threefold repetition): the
   deterministic upstream bot shuffles, and our sampled Nash play often lets it.
+
+## 5. Evaluation of round 1 (Kaggle `hopechess-eval`, 200 games per match, colors alternate)
+
+| match | 2v2 | 1v1 |
+|---|---|---|
+| A (curriculum) vs B (2v2 only) | 0.568 ±0.035 (+47 Elo) | 0.512 (+9) |
+| A vs "hard" | 0.818 (+260) | 0.632 (+94) |
+| B vs "hard" | 0.843 (+291) | 0.665 (+119) |
+| A final vs A at iteration 50 (half-way) | 0.835 (+282) | 0.677 (+129) |
+| A + selective depth-2 (deepen=8) vs A | **0.640 (+100)** | **0.723 (+166)** |
+| A at temperature 0.5 vs A (temperature 1) | 0.435 (−45) | 0.510 |
+| A argmax vs A (temperature 1) | 0.510 | 0.517 |
+
+* A slightly beats B head-to-head in 2v2, but B scores slightly better against
+  "hard". Both differences are within ~2σ, so the curriculum is at least as
+  good as 2v2-only training and we continue from A.
+* Training had not converged: the second half of run A was worth +282 Elo in
+  2v2 and +129 in 1v1. ⇒ round 2 continues training from A (lr 5e-4, 85% 2v2).
+* **Search depth matters a lot at play time.** Re-searching the ~8 most likely
+  joint actions (plus best responses) one round deeper gains +100 to +166 Elo.
+  It costs ~5–10× more time per move (2–7 s on 4 CPU cores), so the live
+  client uses it when the clock allows.
+* Sampling from the Nash mixed strategy (temperature 1) is as good as or better
+  than sharpening it, consistent with simultaneous-move theory. Greedy play is
+  exploitable, and the search knows it.
+
+## 6. Playing next to a teammate that is not the bot (2v2 single seat)
+
+In real 2v2 rooms the bot may sit next to a human or another program. Test:
+bot + upstream "hard" computer vs a team of two "hard" computers (local arena,
+60 games each; reference: "hard" + "hard" scores 0.483).
+
+| who submits first | bot's method | score |
+|---|---|---|
+| random order | team plan | 0.375 |
+| bot always first | team plan (plays its half of a Nash pair) | 0.342 |
+| bot always second | best complement to the teammate's reserved order | **0.633** |
+| bot always first | expectation over teammate replies ~ policy prior | 0.317 |
+
+* Moving **second** with the teammate's order known is strong. Moving **first**
+  with the team plan is harmful when the teammate does not complete the plan:
+  the bot's half is often a move that only works together with its planned
+  partner.
+* The upstream computer ignores the reserved order completely: it scores its
+  move as if it were the only mover. So it is a pessimistic stand-in for a
+  human, who sees the bot's preview and reacts to it.
+* The client therefore (a) waits a few seconds for a human teammate's order
+  (`--wait`) and complements it, and (b) only then moves first with the robust
+  search. With `--teammate bot` (two bot clients on one team) the primary seat
+  plays its half of the team plan at once and the second seat complements it.
+  That second seat effectively reproduces full team play.
