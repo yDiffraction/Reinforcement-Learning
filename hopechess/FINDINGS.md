@@ -1,5 +1,8 @@
 # Hopechess bot: findings log
 
+**Result:** `bot/models/best.pt` beats the upstream "hard" computer **92% in
+2v2** and **79% in 1v1** (300 games each). See the Summary at the end.
+
 Game: [Tom1736/hopechess](https://github.com/Tom1736/hopechess) (snapshot in `upstream/`).
 Both sides submit orders simultaneously; in 2v2 each team submits two
 non-conflicting orders per round. See `upstream/README.md` for the rules.
@@ -200,3 +203,45 @@ Evaluation `timsindelar/hopechess-eval-2`, 200 games each (`bot/logs/eval2.jsonl
   deterministic shuffling forces repetitions that the bot does not avoid,
   because a draw is worth 0 to the value net, the same as a balanced
   position.
+
+## 8. Round 3 (4.5 h fine-tune from R2, lr 3e-4, 25% 1v1) and final evaluation
+
+Notebook `timsindelar/hopechess-rl-r3`: 49k games, 1.66M positions. The extra
+1v1 share lifted in-training 1v1 vs "hard" from ~0.60 to ~0.73, and 2v2 stayed
+at ~0.91. Model: `bot/models/r3.pt` = **`bot/models/best.pt`**.
+
+Evaluation `timsindelar/hopechess-eval-3`, 300 games each (`bot/logs/eval3.jsonl`):
+
+| match | 2v2 | 1v1 |
+|---|---|---|
+| R3 vs R2 | **0.597 (+68 Elo)** | **0.643 (+102)** |
+| R3 vs "hard" (depth 1) | 0.863 (+320) | 0.698 (+146) |
+| R3 + deepen 8 vs "hard" | **0.923 (+277 =0 −23)** | **0.787 (+212 =48 −40)** |
+
+* Fine-tuning at a lower learning rate with more 1v1 games improved **both**
+  modes: 1v1 a lot, and 2v2 by another +68 Elo.
+* Progression in 2v2 head-to-head: R1 → R2 +139, R2 → R3 +68 Elo.
+
+## Summary
+
+* Final bot: `bot/models/best.pt` (8×80 SE-ResNet, ~1.6M parameters, one net
+  for 1v1 and 2v2). It runs a depth-1 Nash matrix search over policy-pruned
+  candidates, plus selective depth-2 when time allows. Total training was
+  ~19 GPU-hours on Kaggle 2×T4 (≈7.2M self-play positions, 204k games).
+* Against the game's own "hard" computer it scores **92% in 2v2** and **79% in
+  1v1** with the default client search.
+* What mattered most, in order:
+  1. A learned value function. The heuristic material eval lost to "hard".
+  2. Solving each round as a zero-sum matrix game, and sampling the Nash
+     strategy when the bot controls the whole team or side.
+  3. More self-play. Every round still added Elo, so training was not converged.
+  4. Selective depth-2 search at play time (+50 to +170 Elo).
+  5. In 2v2 next to another player: the robust deterministic first move, or the
+     best complement when moving second. Without this, a strong bot made its
+     team weaker.
+* Things that did not help: wider candidate lists, a lower sampling
+  temperature, and an optimistic teammate model.
+* Next steps if more compute is available: keep training (still improving);
+  use depth-2 search to generate training targets (expert iteration); add
+  draw-awareness to the value (the 1v1 draws against "hard" come from
+  repetition); try a larger net now that the data volume is larger.
