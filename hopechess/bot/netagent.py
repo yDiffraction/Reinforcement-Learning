@@ -6,11 +6,14 @@ from search import Evaluator, Searcher, WHITE
 
 
 class NetAgent:
-    def __init__(self, net, device='cpu', temperature=1.0, seed=None, **search_kw):
+    def __init__(self, net, device='cpu', temperature=1.0, seed=None, solo=0, **search_kw):
         self.rng = np.random.default_rng(seed)
         self.searcher = Searcher(Evaluator(net, device), rng=self.rng, **search_kw)
         self.temperature = temperature
         self.name = 'net'
+        # solo=1: when moving first in 2v2, assume an independent teammate
+        # (value own moves by expectation over the teammate's likely replies)
+        self.solo = solo
         self.last = None
 
     def pick(self, acts, probs):
@@ -22,6 +25,14 @@ class NetAgent:
         return acts[self.rng.choice(len(acts), p=p)]
 
     def act(self, game, color, mode, reserved=None):
+        if mode == 1 and reserved is None and self.solo:
+            r = self.searcher.run_first_mover(game, color)
+            self.last = r
+            m = self.pick([(m,) for m in r['moves']], r['probs'])[0]
+            allowed = game.team_legal(color, m) if m >= 0 else []
+            # second element only matters if the caller controls both seats
+            b = max(allowed, key=lambda c: 0) if allowed else -1
+            return [m, b]
         r = self.searcher.run([(game, mode, color if reserved is not None else None, reserved)])[0]
         self.last = r
         acts, probs = (r['wa'], r['x']) if color == WHITE else (r['ba'], r['y'])

@@ -8,8 +8,12 @@ Agent: --agent models/best.pt[:deepen=8] (default models/best.pt:deepen=8) | com
 
 The bot rebuilds the exact engine state by replaying the room's round
 history, so repetition counts and rest flags match the server. In 2v2 it
-reads its teammate's pending order (shared within a team) and plays a
-complementary move; if it moves first it plays its half of the team plan.
+reads its teammate's pending order (shared within a team) and plays the best
+complementary move. With a human teammate (default) it first waits --wait
+seconds for that order; if none comes it moves first with a move that is
+robust to the teammate's likely replies. With --teammate bot (two bot
+clients on one team) the primary seat moves at once with the team plan and
+the second seat complements it.
 """
 import argparse, json, os, sys, threading, time, urllib.error, urllib.parse, urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -48,7 +52,7 @@ def rebuild(game_json, mode):
 
 
 class Bot:
-    def __init__(self, server, agent, verbose=True, rematch=True, think_delay=0.0):
+    def __init__(self, server, agent, verbose=True, rematch=True, think_delay=0.0, teammate='human', wait=6.0):
         self.server = server.rstrip('/')
         self.agent = agent
         self.verbose = verbose
@@ -59,6 +63,8 @@ class Bot:
         self.rematched = set()
         self.lock = threading.Lock()
         self.max_deepen = None
+        self.teammate, self.wait = teammate, wait
+        self.seen, self.timers, self.latest = {}, {}, None
 
     def req(self, path, body=None):
         data = None if body is None else json.dumps(body).encode()
@@ -112,6 +118,22 @@ class Bot:
                     reserved = code_of(mates[0]['move'])
                     if reserved < 0:
                         reserved = None
+            self.latest = snap
+            solo = False
+            if mode == 1 and reserved is None:
+                # Wait a little for the teammate's order (it reaches us as a
+                # reservation), unless we are the primary seat of a bot team.
+                primary = seat in ('white', 'black')
+                wait = 0.0 if (self.teammate == 'bot' and primary) else self.wait
+                first_seen = self.seen.setdefault(key, time.time())
+                left = wait - (time.time() - first_seen)
+                if left > 0:
+                    if key not in self.timers:
+                        self.timers[key] = threading.Timer(left + 0.05, lambda: self.on_state(self.latest))
+                        self.timers[key].daemon = True
+                        self.timers[key].start()
+                    return
+                solo = self.teammate == 'human' or not primary
             if self.think_delay:
                 time.sleep(self.think_delay)
             t = time.time()
@@ -121,6 +143,8 @@ class Bot:
             elif reserved is not None:
                 move = self.agent.act(g, color, 1, reserved)[0]
             else:
+                if hasattr(self.agent, 'solo'):
+                    self.agent.solo = int(solo)
                 move = self.agent.act(g, color, 1)[0]
             self.done_for.add(key)
             try:
@@ -182,10 +206,15 @@ def main():
     ap.add_argument('--unrated', action='store_true')
     ap.add_argument('--agent', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', 'best.pt') + ':deepen=8')
     ap.add_argument('--no-rematch', action='store_true')
+    ap.add_argument('--teammate', choices=['human', 'bot'], default='human',
+                    help='2v2: human = wait for the teammate, else move robustly first; '
+                         'bot = primary seat moves at once with the team plan, the other seat complements it')
+    ap.add_argument('--wait', type=float, default=6.0, help='2v2: seconds to wait for the teammate before moving')
     ap.add_argument('--quiet', action='store_true')
     o = ap.parse_args()
     spec = 'net:' + o.agent if ('.pt' in o.agent and not o.agent.startswith('net:')) else o.agent
-    bot = Bot(o.server, make_agent(spec, threads=os.cpu_count() or 4), verbose=not o.quiet, rematch=not o.no_rematch)
+    bot = Bot(o.server, make_agent(spec, threads=os.cpu_count() or 4), verbose=not o.quiet, rematch=not o.no_rematch,
+              teammate=o.teammate, wait=o.wait)
     if o.create:
         bot.create(o.mode, o.color if o.color != 'random' else 'white', o.minutes, not o.unrated)
     else:

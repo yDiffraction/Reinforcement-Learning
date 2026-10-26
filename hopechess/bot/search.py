@@ -219,6 +219,52 @@ class Searcher:
             self._deepen(items, out)
         return out
 
+    def run_first_mover(self, game, color, k_mine=10, k_mate=10):
+        """2v2 seat that submits before an unknown teammate (human, other bot).
+        Each own move a is valued by the expectation over the teammate's reply
+        b ~ policy prior (restricted to moves compatible with a), against the
+        opponent team's candidate pairs; the reduced matrix (own single moves x
+        opponent pairs) is solved for a Nash strategy over single moves."""
+        mode = 1
+        logits, _ = self.ev.root(hc.compact(game, mode)[None])
+        opp = 1 - color
+        mine_l, opp_l = game.legal(color), game.legal(opp)
+        if not mine_l:
+            return dict(moves=[-1], probs=np.ones(1))
+        pm = softmax_prior(logits[0, color], mine_l)
+        po = softmax_prior(logits[0, opp], opp_l)
+        ranked = sorted(mine_l, key=lambda m: -pm.get(m, 0.0))
+        singles = ranked[:k_mine] + [m for m in tactical(game, color) if m not in ranked[:k_mine]][:6]
+        mates = ranked[:k_mate]
+        pairs, owner, weight = [], [], []
+        for a in singles:
+            allowed = set(game.team_legal(color, a))
+            bs = [b for b in mates if b in allowed]
+            if not bs and allowed:
+                bs = [max(allowed, key=lambda b: pm.get(b, 0.0))]
+            if not bs:
+                bs = [-1]
+            w = np.array([pm.get(b, 0.0) + 1e-6 for b in bs])
+            w /= w.sum()
+            for b, wb in zip(bs, w):
+                pairs.append((a, b)); owner.append(a); weight.append(wb)
+        oacts = self._pairs(game, opp, po)
+        wa, ba = (pairs, oacts) if color == WHITE else (oacts, pairs)
+        comp, res = hc.successors_batch([game], [mode], [wa], [ba], THREADS)
+        vals = np.zeros(len(res), np.float32)
+        live = np.nonzero(res == 0)[0]
+        if len(live):
+            vals[live] = self.ev.values(comp[live])
+        vals[res == 1], vals[res == 2], vals[res == 3] = 1.0, -1.0, 0.0
+        M = vals.reshape(len(wa), len(ba))
+        M = M if color == WHITE else -M.T          # rows: my pairs, my point of view
+        idx = {a: i for i, a in enumerate(singles)}
+        R = np.zeros((len(singles), M.shape[1]))
+        for r, (a, w) in enumerate(zip(owner, weight)):
+            R[idx[a]] += w * M[r]
+        x, y, v = hc.solve_nash(R, self.nash_iters)
+        return dict(moves=singles, probs=x, value=v, R=R, opp=oacts, opp_probs=y)
+
     def _deepen(self, items, out):
         """Selective depth 2: replace the values of the most relevant joint
         actions (likely under both Nash strategies, plus best responses to our

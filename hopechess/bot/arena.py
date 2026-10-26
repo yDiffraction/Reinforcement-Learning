@@ -10,7 +10,32 @@ import hcengine as hc
 import agents as A
 
 
+class MixedTeam:
+    """2v2 team of two different agents, one per seat. Each round a random
+    seat submits first; the other sees that reservation (as on the server)."""
+    def __init__(self, a, b, seed=None):
+        import numpy as np
+        self.a, self.b = a, b
+        self.rng = np.random.default_rng(seed)
+
+    def act(self, game, color, mode, reserved=None):
+        if mode == 0:
+            return self.a.act(game, color, 0)
+        order = os.environ.get('MIXED_ORDER', 'random')
+        a_first = order == 'a_first' or (order == 'random' and self.rng.random() < 0.5)
+        first, second = (self.a, self.b) if a_first else (self.b, self.a)
+        m1 = first.act(game, color, 1)[0]
+        if m1 < 0:
+            return [-1, -1]
+        allowed = game.team_legal(color, m1)
+        m2 = second.act(game, color, 1, m1)[0] if allowed else -1
+        return [m1, m2]
+
+
 def make_agent(spec, seed=None, threads=1):
+    if '+' in spec:
+        a, b = spec.split('+', 1)
+        return MixedTeam(make_agent(a, seed, threads), make_agent(b, None if seed is None else seed + 7, threads), seed)
     if spec == 'random':
         return A.RandomAgent(seed)
     if spec in ('computer-normal', 'computer-hard'):
