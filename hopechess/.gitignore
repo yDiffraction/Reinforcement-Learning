@@ -1,4 +1,6 @@
 *.so
+*.pyd
+bot/build/
 __pycache__/
 *.pt
 !bot/models/*.pt

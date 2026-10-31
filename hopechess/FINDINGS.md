@@ -222,6 +222,49 @@ Evaluation `timsindelar/hopechess-eval-3`, 300 games each (`bot/logs/eval3.jsonl
   modes: 1v1 a lot, and 2v2 by another +68 Elo.
 * Progression in 2v2 head-to-head: R1 → R2 +139, R2 → R3 +68 Elo.
 
+## 9. Play-time search on an Arc 140T iGPU (10 s per move)
+
+The live bot runs on a laptop iGPU (`torch.xpu`). The value net evaluates
+~14.5k positions/s there; folding BatchNorm into the convolutions
+(`model.fuse`, inference only) raises this to ~16.5k/s. A 2v2 depth-1 team
+search costs ~1.3k evaluations (0.15 s). The fixed `deepen=16` step took 3–5 s
+for the second seat, and the robust first-mover search took 0.4–1 s at depth 1.
+
+**Time-budgeted deepening** (`budget=S`): the selective depth-2 step repeats.
+Each step re-solves the matrix and re-ranks the cells: best responses to the
+top candidates, then likely joint actions, with near-equilibrium rows and
+columns as tie-breaks. Steps continue until the predicted next step would
+overrun the budget. A small first step measures the cost per child.
+
+Evaluation (`bot/searcheval.py`): full games at ~8 s per move would take
+hours, so each comparison scores one round from fixed positions. The
+positions come from policy-sampled 2v2 games at rounds 4–36. Each team plays as
+two bot seats on the server do: the argmax robust first move, then the
+second seat's Nash complement. The resulting joint actions are valued by a
+depth-1 search from the child (an exact value if the game ends). The score is
+0.5 + (value as White − value as Black)/4 against the old search (`deepen=16`,
+first mover at depth 1). Every run was capped at 5 minutes.
+
+| variant (vs `deepen=16`) | positions | one-round score |
+|---|---|---|
+| budget 8 s, second seat (and team plan) | 19 | **0.5064 ±0.0032** |
+| budget 8 s, also deepen the first mover | 9 | 0.5079 ±0.0045 |
+| budget 8 s, narrower child searches (16/10/24 instead of 24/12/36) | 6 | 0.5099 ±0.0062 |
+
+* Using the whole budget for depth 2 helps, consistent with sections 5 and 7.
+* Deepening the first mover changed 39% of its moves but gave no measurable
+  gain: the paired difference is +0.0003 ±0.003 over 9 positions. It also doubles a
+  bot team's round time (both seats think in turn), so it is off by default
+  (`fm_deepen=1` enables it).
+* Narrower child searches (more cells in the same time) tracked the default
+  widths position by position. No reason to change them.
+* With `budget=8`, the second seat took 7.8–9.4 s. With `budget=7` it took
+  6.8–7.4 s. The default is `deepen=16:budget=7.5` (≈7.5–9 s per move, under
+  10 s). The client shortens the budget to half the per-move share of the
+  clock in fast time controls.
+* These one-round scores are small by construction (one round of a long game),
+  and the sample is small. They rank settings; they are not Elo estimates.
+
 ## Summary
 
 * Final bot: `bot/models/best.pt` (8×80 SE-ResNet, ~1.6M parameters, one net

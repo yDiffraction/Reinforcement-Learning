@@ -7,7 +7,7 @@ network (exact values for finished games), and solve the resulting zero-sum
 matrix game. The Nash strategies are both the move distribution to play and
 the policy training targets.
 """
-import os
+import os, time
 import numpy as np
 import torch
 import hcengine as hc
@@ -25,7 +25,7 @@ class Evaluator:
         import copy, time
         self.net = net.to(device).eval()
         self.device = torch.device(device)
-        self.half = (self.device.type == 'cuda') if half is None else half
+        self.half = (self.device.type in ('cuda', 'xpu')) if half is None else half
         self.chunk = chunk
         self.devices = [torch.device(d) for d in (devices or [device])]
         self.replicas = [self.net] + [copy.deepcopy(self.net).to(d).eval() for d in self.devices[1:]]
@@ -43,6 +43,8 @@ class Evaluator:
         t = torch.from_numpy(np.ascontiguousarray(arr))
         if dev.type == 'cuda':
             t = t.pin_memory().to(dev, non_blocking=True)
+        elif dev.type != 'cpu':
+            t = t.to(dev)
         return model.expand(t)
 
     # inputs are compact uint8 encodings [N, 80]
@@ -111,7 +113,7 @@ def tactical(game, color):
 
 class Searcher:
     def __init__(self, evaluator, k1=24, k_single=12, k_pairs=36, nash_iters=800,
-                 noise=0.0, noise_alpha=0.3, rng=None, heuristic=None, deepen=0):
+                 noise=0.0, noise_alpha=0.3, rng=None, heuristic=None, deepen=0, budget=0.0, fm_deepen=0):
         self.ev = evaluator
         self.k1, self.k_single, self.k_pairs = k1, k_single, k_pairs
         self.nash_iters = nash_iters
@@ -119,6 +121,10 @@ class Searcher:
         self.rng = rng or np.random.default_rng()
         self.heuristic = heuristic  # if set (scale), ignore the net: uniform priors, material values
         self.deepen = deepen        # >0: re-search this many likely joint actions one round deeper
+        # >0: seconds per call; deepening repeats in steps of `deepen` cells,
+        # re-ranked by the updated strategies, until the time is used up
+        self.budget = budget
+        self.fm_deepen = fm_deepen  # also deepen the 2v2 first-mover search (no gain measured)
 
     def _noisy(self, prior):
         if not self.noise or len(prior) < 2:
@@ -171,6 +177,7 @@ class Searcher:
     def run(self, items):
         """items: list of (game, mode, reserved_color, reserved_code). Returns a
         list of dicts with wa, ba, x, y, v, root_v, pw, pb (priors)."""
+        t0 = time.time()
         n = len(items)
         if self.heuristic is None:
             feats = np.stack([hc.compact(g, mode) for g, mode, _, _ in items])
@@ -216,7 +223,10 @@ class Searcher:
             R = res[offs[i]:offs[i + 1]].reshape(len(wa), len(ba))
             out.append(dict(wa=wa, ba=ba, x=x, y=y, v=v, root_v=float(root_v[i]), pw=pw, pb=pb, M=M, R=R))
         if self.deepen and self.heuristic is None:
-            self._deepen(items, out)
+            jobs = [_NashJob(g, mode, r, self.nash_iters) for (g, mode, _, _), r in zip(items, out)]
+            self._deepen(jobs, t0)
+            for jb, r in zip(jobs, out):
+                r.update(M=jb.M, x=jb.x, y=jb.y, v=jb.v)
         return out
 
     def run_first_mover(self, game, color, k_mine=10, k_mate=10, beta=0.0):
@@ -225,6 +235,7 @@ class Searcher:
         b ~ policy prior (restricted to moves compatible with a), against the
         opponent team's candidate pairs; the reduced matrix (own single moves x
         opponent pairs) is solved for a Nash strategy over single moves."""
+        t0 = time.time()
         mode = 1
         logits, _ = self.ev.root(hc.compact(game, mode)[None])
         opp = 1 - color
@@ -256,62 +267,137 @@ class Searcher:
         if len(live):
             vals[live] = self.ev.values(comp[live])
         vals[res == 1], vals[res == 2], vals[res == 3] = 1.0, -1.0, 0.0
-        M = vals.reshape(len(wa), len(ba))
-        M = M if color == WHITE else -M.T          # rows: my pairs, my point of view
-        if beta:
+        jb = _FirstMoverJob(game, mode, wa, ba, vals.reshape(len(wa), len(ba)), res.reshape(len(wa), len(ba)),
+                            color, singles, owner, weight, beta, self.nash_iters)
+        if self.deepen and self.fm_deepen:
+            self._deepen([jb], t0)
+        return dict(moves=singles, probs=jb.x, value=jb.v, R=jb.Rm, opp=oacts, opp_probs=jb.y)
+
+    def _deepen(self, jobs, t0):
+        """Selective depth 2: replace the values of the most relevant joint
+        actions (likely under both Nash strategies, plus best responses to the
+        main candidates) by a depth-1 search from the child position. Without
+        a budget this is one step of `deepen` cells per job; with one, steps
+        repeat until the time since t0 is used up."""
+        sub = Searcher(self.ev, self.k1, self.k_single, self.k_pairs, self.nash_iters, rng=self.rng)
+        per_child = None
+        while True:
+            picks = [(jb, a, b) for jb in jobs for a, b in jb.cells(self.deepen)]
+            if self.budget:
+                # a small first step measures the cost per child; later steps
+                # stop short of overrunning the budget (slowest step so far, +20%)
+                n = 8 if per_child is None else int((self.budget - (time.time() - t0)) / (1.2 * per_child))
+                picks = picks[:max(0, n)]
+            if not picks:
+                return
+            t = time.time()
+            kids = [(jb.child(a, b), jb.mode, None, None) for jb, a, b in picks]
+            res = []
+            for j in range(0, len(kids), 64):
+                res += sub.run(kids[j:j + 64])
+            per_child = max(per_child or 0.0, (time.time() - t) / len(kids))
+            touched = {}
+            for (jb, a, b), cr in zip(picks, res):
+                jb.M[a, b] = cr['v']
+                jb.done[a, b] = True
+                touched[id(jb)] = jb
+            for jb in touched.values():
+                jb.solve()
+            if not self.budget:
+                return
+
+
+def _closeness(gap, scale=0.05):
+    return np.exp(-np.maximum(gap, 0.0) / scale)
+
+
+def _ranked(pri, done, br, n):
+    """br cells first, then the n highest-priority other cells; skips done cells."""
+    pri = pri.copy()
+    pri[done] = -1
+    out = [c for c in br if not done[c]]
+    for k in np.argsort(-pri, axis=None):
+        c = divmod(int(k), pri.shape[1])
+        if pri[c] < 0 or len(out) >= len(br) + n:
+            break
+        if c not in br:
+            out.append(c)
+    return out
+
+
+class _NashJob:
+    """A root matrix (rows wa, cols ba, White's values) whose cells can be deepened."""
+    def __init__(self, game, mode, r, iters):
+        self.game, self.mode, self.wa, self.ba, self.iters = game, mode, r['wa'], r['ba'], iters
+        self.M = r['M'].copy()
+        self.done = r['R'] != 0
+        self.x, self.y, self.v = r['x'], r['y'], r['v']
+
+    def child(self, a, b):
+        wa, ba = self.wa[a], self.ba[b]
+        return self.game.play(wa[0], ba[0]) if self.mode == 0 else self.game.play2(wa[0], wa[1], ba[0], ba[1])
+
+    def solve(self):
+        self.x, self.y, self.v = hc.solve_nash(self.M.astype(np.float64), self.iters)
+
+    def cells(self, n):
+        """Best responses to the top-4 candidates of each side, then the n most
+        likely joint actions (near-equilibrium rows and columns break ties)."""
+        x, y, M = self.x, self.y, self.M
+        br = {(int(a), int(np.argmin(M[a]))) for a in np.argsort(-x)[:4]}
+        br |= {(int(np.argmax(M[:, b])), int(b)) for b in np.argsort(-y)[:4]}
+        sx = x + 1e-3 * _closeness(self.v - M @ y)
+        sy = y + 1e-3 * _closeness(x @ M - self.v)
+        return _ranked(np.outer(sx, sy), self.done, br, n)
+
+
+class _FirstMoverJob(_NashJob):
+    """run_first_mover's pair matrix: rows are (own move, teammate reply)
+    pairs, reduced to own single moves by the teammate-reply weights."""
+    def __init__(self, game, mode, wa, ba, M, R, color, singles, owner, weight, beta, iters):
+        self.game, self.mode, self.wa, self.ba, self.iters = game, mode, wa, ba, iters
+        self.M, self.done = M, R != 0
+        self.color, self.beta = color, beta
+        idx = {a: i for i, a in enumerate(singles)}
+        self.own = np.array([idx[a] for a in owner])
+        self.w0 = np.array(weight)
+        self.solve()
+
+    def mine(self):
+        return self.M if self.color == WHITE else -self.M.T     # rows: my pairs, my point of view
+
+    def solve(self):
+        Mm = self.mine()
+        w = self.w0
+        if self.beta:
             # quantal-response teammate: prefers replies that work well with a
             # (against the opponent's Nash strategy of the full pair game)
-            _, yo, _ = hc.solve_nash(M.astype(np.float64), self.nash_iters // 2)
-            q = M @ yo
-            weight = np.array(weight)
-            for a in singles:
-                rows = [r for r, o in enumerate(owner) if o == a]
-                z = np.log(weight[rows]) + beta * (q[rows] - q[rows].max())
+            _, yo, _ = hc.solve_nash(Mm.astype(np.float64), self.iters // 2)
+            q = Mm @ yo
+            w = w.copy()
+            for a in np.unique(self.own):
+                rows = self.own == a
+                z = np.log(w[rows]) + self.beta * (q[rows] - q[rows].max())
                 z = np.exp(z - z.max())
-                weight[rows] = z / z.sum()
-        idx = {a: i for i, a in enumerate(singles)}
-        R = np.zeros((len(singles), M.shape[1]))
-        for r, (a, w) in enumerate(zip(owner, weight)):
-            R[idx[a]] += w * M[r]
-        x, y, v = hc.solve_nash(R, self.nash_iters)
-        return dict(moves=singles, probs=x, value=v, R=R, opp=oacts, opp_probs=y)
+                w[rows] = z / z.sum()
+        W = np.zeros((self.own.max() + 1, len(w)))
+        W[self.own, np.arange(len(w))] = w
+        self.W, self.Rm = W, W @ Mm
+        self.x, self.y, self.v = hc.solve_nash(self.Rm, self.iters)
 
-    def _deepen(self, items, out):
-        """Selective depth 2: replace the values of the most relevant joint
-        actions (likely under both Nash strategies, plus best responses to our
-        main candidates) by a depth-1 search from the child position."""
-        child_items, where = [], []
-        for i, ((g, mode, _, _), r) in enumerate(zip(items, out)):
-            x, y, M, R = r['x'], r['y'], r['M'], r['R']
-            cells = set()
-            prob = np.outer(x, y)
-            for k in np.argsort(-prob, axis=None)[:self.deepen]:
-                cells.add(divmod(int(k), M.shape[1]))
-            for a in np.argsort(-x)[:4]:
-                cells.add((int(a), int(np.argmin(M[a]))))
-            for b in np.argsort(-y)[:4]:
-                cells.add((int(np.argmax(M[:, b])), int(b)))
-            for a, b in cells:
-                if R[a, b] != 0:
-                    continue
-                wa, ba = r['wa'][a], r['ba'][b]
-                child = g.play(wa[0], ba[0]) if mode == 0 else g.play2(wa[0], wa[1], ba[0], ba[1])
-                child_items.append((child, mode, None, None))
-                where.append((i, a, b))
-        if not child_items:
-            return
-        sub = Searcher(self.ev, self.k1, self.k_single, self.k_pairs, self.nash_iters, rng=self.rng)
-        res = []
-        for j in range(0, len(child_items), 64):
-            res += sub.run(child_items[j:j + 64])
-        touched = set()
-        for (i, a, b), cr in zip(where, res):
-            out[i]['M'] = out[i]['M'].copy() if i not in touched else out[i]['M']
-            out[i]['M'][a, b] = cr['v']
-            touched.add(i)
-        for i in touched:
-            x, y, v = hc.solve_nash(out[i]['M'].astype(np.float64), self.nash_iters)
-            out[i].update(x=x, y=y, v=v)
+    def cells(self, n):
+        """As _NashJob.cells, on the single-move game: the opponent's best
+        replies to my top-4 moves and my best move against its top-4 pairs
+        (each via the move's two likeliest teammate replies), then likely
+        cells, a single move's weight spread over its pairs."""
+        x, y, R, W = self.x, self.y, self.Rm, self.W
+        top = lambda s: [r for r in np.argsort(-W[s])[:2] if W[s, r] > 0]
+        br = {(int(r), int(np.argmin(R[s]))) for s in np.argsort(-x)[:4] for r in top(s)}
+        br |= {(int(r), int(j)) for j in np.argsort(-y)[:4] for r in top(int(np.argmax(R[:, j])))}
+        sx = W.T @ (x + 1e-3 * _closeness(self.v - R @ y))
+        sy = y + 1e-3 * _closeness(x @ R - self.v)
+        mine = _ranked(np.outer(sx, sy), self.done if self.color == WHITE else self.done.T, br, n)
+        return mine if self.color == WHITE else [(j, r) for r, j in mine]
 
 
 def marginal(acts, probs):

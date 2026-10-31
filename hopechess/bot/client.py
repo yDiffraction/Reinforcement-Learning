@@ -4,7 +4,8 @@
     python3 client.py --server http://localhost:4173 --create --mode 2v2 --color white
     # join an existing room (any open seat, or a team)
     python3 client.py --server http://localhost:4173 --room 0421 --color black
-Agent: --agent models/best.pt[:deepen=N] (default models/best.pt:deepen=16) | computer-hard | heur-nash | random
+Agent: --agent models/best.pt[:deepen=N][:budget=S] (default models/best.pt:deepen=16:budget=7.5) | computer-hard | heur-nash | random
+Device: --device auto|cuda|xpu|cpu (auto picks CUDA, then Intel XPU via torch.xpu, then CPU)
 
 The bot rebuilds the exact engine state by replaying the room's round
 history, so repetition counts and rest flags match the server. In 2v2 it
@@ -22,6 +23,18 @@ from arena import make_agent
 
 PROMO = {'q': 1, 'r': 2, 'b': 3, 'n': 4}
 PROMO_NAME = {1: 'q', 2: 'r', 3: 'b', 4: 'n'}
+# Hosts behind Cloudflare reject urllib's default "Python-urllib" agent with 403.
+USER_AGENT = 'hopechess-bot/1.0'
+
+
+def request(url, body=None, timeout=15, headers=None):
+    """GET (body None) or POST JSON; returns the open response."""
+    headers = {'User-Agent': USER_AGENT, **(headers or {})}
+    if body is not None:
+        headers['Content-Type'] = 'application/json'
+    r = urllib.request.Request(url, data=None if body is None else json.dumps(body).encode(),
+                               method='GET' if body is None else 'POST', headers=headers)
+    return urllib.request.urlopen(r, timeout=timeout)
 
 
 def code_of(m):
@@ -52,8 +65,13 @@ def rebuild(game_json, mode):
 
 
 class Bot:
-    def __init__(self, server, agent, verbose=True, rematch=True, think_delay=0.0, teammate='human', wait=6.0):
+    def __init__(self, server, agent, verbose=True, rematch=True, think_delay=0.0, teammate='human', wait=6.0,
+                 log=None, budget=True):
         self.server = server.rstrip('/')
+        self.log = log or (lambda msg: print(msg, flush=True))
+        self.use_budget = budget
+        self.stopped = threading.Event()
+        self.resp = None
         self.agent = agent
         self.verbose = verbose
         self.rematch = rematch
@@ -67,11 +85,8 @@ class Bot:
         self.seen, self.timers, self.latest = {}, {}, None
 
     def req(self, path, body=None):
-        data = None if body is None else json.dumps(body).encode()
-        r = urllib.request.Request(self.server + path, data=data, method='GET' if body is None else 'POST',
-                                   headers={'Content-Type': 'application/json'} if body is not None else {})
         try:
-            with urllib.request.urlopen(r, timeout=15) as resp:
+            with request(self.server + path, body) as resp:
                 return json.loads(resp.read())
         except urllib.error.HTTPError as e:
             msg = e.read().decode(errors='replace')
@@ -80,16 +95,35 @@ class Bot:
     def create(self, mode, color, minutes, rated):
         reply = self.req('/api/rooms', {'mode': mode, 'color': color, 'timeLimitMinutes': minutes, 'rated': rated})
         self.session = reply
-        print(f"room {reply['code']} created ({mode}); bot seat {reply['seat']}", flush=True)
+        self.log(f"room {reply['code']} created ({mode}); bot seat {reply['seat']}")
         return reply
 
     def join(self, code, color):
         reply = self.req(f'/api/rooms/{code}/join', {'color': color})
         self.session = reply
-        print(f"joined room {reply['code']} as {reply['seat']}", flush=True)
+        self.log(f"joined room {reply['code']} as {reply['seat']}")
         return reply
 
+    def stop(self, leave=True):
+        """End run(); with leave=True also give up the seat on the server."""
+        self.stopped.set()
+        for t in self.timers.values():
+            t.cancel()
+        if leave and self.session:
+            try:
+                self.req(f"/api/rooms/{self.session['code']}/leave", {'token': self.session['token']})
+            except (RuntimeError, OSError):
+                pass
+        resp = self.resp
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
     def on_state(self, snap):
+        if self.stopped.is_set():
+            return
         with self.lock:
             game = snap['game']
             mode = 1 if snap['mode'] == '2v2' else 0
@@ -100,12 +134,12 @@ class Bot:
                 gid = snap['gameId']
                 if gid not in self.rematched:
                     self.rematched.add(gid)
-                    print('game over:', game['result'].get('reason'), flush=True)
+                    self.log(f"game over: {game['result'].get('reason')}")
                     if self.rematch:
                         try:
                             self.req(f"/api/rooms/{snap['code']}/rematch", {'token': self.session['token'], 'gameId': gid})
                         except RuntimeError as e:
-                            print('rematch:', e, flush=True)
+                            self.log(f'rematch: {e}')
                 return
             key = (snap['gameId'], game['round'])
             if snap['seatSubmitted'].get(seat) or key in self.done_for:
@@ -152,24 +186,30 @@ class Bot:
                 self.req(f"/api/rooms/{snap['code']}/move", {'token': self.session['token'], 'gameId': snap['gameId'],
                                                              'round': game['round'], 'move': move_json(move)})
                 if self.verbose:
-                    print(f"round {game['round']}: {seat} plays {move_json(move)} ({time.time() - t:.2f}s)", flush=True)
+                    self.log(f"round {game['round']}: {seat} plays {move_json(move)} ({time.time() - t:.2f}s)")
             except RuntimeError as e:
-                print('move rejected:', e, flush=True)
+                self.log(f'move rejected: {e}')
                 self.done_for.discard(key)
 
     def budget(self, snap):
         """Use the selective depth-2 search only when the clock allows it."""
         searcher = getattr(self.agent, 'searcher', None)
-        if searcher is None:
+        if searcher is None or not self.use_budget:
             return
         if self.max_deepen is None:
-            self.max_deepen = searcher.deepen
+            self.max_deepen, self.max_think = searcher.deepen, searcher.budget
         clock = snap.get('clock') or {}
         left = (clock.get('remainingMs') or {}).get(snap['you'])
         if clock.get('limitMinutes') is None or left is None:
-            searcher.deepen = self.max_deepen
+            searcher.deepen, searcher.budget = self.max_deepen, self.max_think
             return
         per_move = left / 1000.0 / 60.0   # assume ~60 more rounds
+        if self.max_think:
+            # time-budgeted search: think at most half the per-move share, and
+            # skip depth 2 below a second
+            think = min(self.max_think, 0.5 * per_move)
+            searcher.deepen, searcher.budget = (self.max_deepen, think) if think >= 1 else (0, 0.0)
+            return
         searcher.deepen = (self.max_deepen if per_move > 15 else min(self.max_deepen, 8) if per_move > 8
                            else min(self.max_deepen, 4) if per_move > 3 else 0)
 
@@ -177,9 +217,10 @@ class Bot:
         s = self.session
         url = f"{self.server}/api/rooms/{s['code']}/events?token={urllib.parse.quote(s['token'])}"
         self.on_state(s['snapshot'])
-        while True:
+        while not self.stopped.is_set():
             try:
-                with urllib.request.urlopen(url, timeout=60) as resp:
+                with request(url, timeout=60) as resp:
+                    self.resp = resp
                     event, data = None, []
                     for raw in resp:
                         line = raw.decode().rstrip('\n')
@@ -192,8 +233,13 @@ class Bot:
                                 self.on_state(json.loads('\n'.join(data)))
                             event, data = None, []
             except Exception as e:  # reconnect on stream errors / keepalive timeouts
+                if self.stopped.is_set():
+                    break
                 if self.verbose:
-                    print('stream:', e, flush=True)
+                    self.log(f'stream: {e}')
+                if isinstance(e, urllib.error.HTTPError) and e.code in (401, 404):
+                    self.log('seat or room is gone; stopping')
+                    break
                 time.sleep(1)
 
 
@@ -206,16 +252,17 @@ def main():
     ap.add_argument('--color', default='random')
     ap.add_argument('--minutes', type=int, default=None)
     ap.add_argument('--unrated', action='store_true')
-    ap.add_argument('--agent', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', 'best.pt') + ':deepen=16')
+    ap.add_argument('--agent', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models', 'best.pt') + ':deepen=16:budget=7.5')
     ap.add_argument('--no-rematch', action='store_true')
     ap.add_argument('--teammate', choices=['human', 'bot'], default='human',
                     help='2v2: human = wait for the teammate, else move robustly first; '
                          'bot = primary seat moves at once, the other seat complements it')
     ap.add_argument('--wait', type=float, default=6.0, help='2v2: seconds to wait for the teammate before moving')
+    ap.add_argument('--device', default='auto', help='network device: auto (cuda, then xpu, then cpu) | cuda | xpu | cpu')
     ap.add_argument('--quiet', action='store_true')
     o = ap.parse_args()
     spec = 'net:' + o.agent if ('.pt' in o.agent and not o.agent.startswith('net:')) else o.agent
-    bot = Bot(o.server, make_agent(spec, threads=os.cpu_count() or 4), verbose=not o.quiet, rematch=not o.no_rematch,
+    bot = Bot(o.server, make_agent(spec, threads=os.cpu_count() or 4, device=o.device), verbose=not o.quiet, rematch=not o.no_rematch,
               teammate=o.teammate, wait=o.wait)
     if o.create:
         bot.create(o.mode, o.color if o.color != 'random' else 'white', o.minutes, not o.unrated)

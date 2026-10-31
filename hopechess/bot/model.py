@@ -123,6 +123,20 @@ def save(net, path, **extra):
     torch.save(dict(cfg=net.cfg, state=net.state_dict(), **extra), path)
 
 
+def fuse(net):
+    """Inference-only copy with each BatchNorm folded into its convolution
+    (~14% faster value evaluation on an Arc iGPU)."""
+    import copy
+    from torch.nn.utils.fusion import fuse_conv_bn_eval
+    f = copy.deepcopy(net).eval()
+    for blk in f.trunk:
+        blk.c1, blk.b1 = fuse_conv_bn_eval(blk.c1, blk.b1), nn.Identity()
+        blk.c2, blk.b2 = fuse_conv_bn_eval(blk.c2, blk.b2), nn.Identity()
+    for seq in (f.stem, f.pconv, f.vconv):
+        seq[0], seq[1] = fuse_conv_bn_eval(seq[0], seq[1]), nn.Identity()
+    return f
+
+
 def load(path, device='cpu'):
     ck = torch.load(path, map_location=device, weights_only=False)
     net = Net(**ck['cfg'])

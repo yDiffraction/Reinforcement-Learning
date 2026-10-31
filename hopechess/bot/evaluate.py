@@ -22,7 +22,7 @@ class NetPlayer:
         kw = dict(kv.split('=') for kv in parts[1:])
         self.temperature = float(kw.pop('temperature', 1.0))
         devs = [f'cuda:{i}' for i in range(torch.cuda.device_count())] if str(device).startswith('cuda') else [device]
-        self.searcher = Searcher(Evaluator(net, device, devices=devs), rng=rng, **{k: int(v) for k, v in kw.items()})
+        self.searcher = Searcher(Evaluator(net, device, devices=devs), rng=rng, **{k: float(v) if k == 'budget' else int(v) for k, v in kw.items()})
         self.spec = spec
 
 

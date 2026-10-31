@@ -32,10 +32,10 @@ class MixedTeam:
         return [m1, m2]
 
 
-def make_agent(spec, seed=None, threads=1):
+def make_agent(spec, seed=None, threads=1, device='cpu'):
     if '+' in spec:
         a, b = spec.split('+', 1)
-        return MixedTeam(make_agent(a, seed, threads), make_agent(b, None if seed is None else seed + 7, threads), seed)
+        return MixedTeam(make_agent(a, seed, threads, device), make_agent(b, None if seed is None else seed + 7, threads, device), seed)
     if spec == 'random':
         return A.RandomAgent(seed)
     if spec in ('computer-normal', 'computer-hard'):
@@ -45,7 +45,7 @@ def make_agent(spec, seed=None, threads=1):
         return A.HeuristicNashAgent(seed=seed, **{k: float(v) if k in ('scale', 'temperature') else int(v) for k, v in kw.items()})
     if spec.startswith('net:'):
         import netagent
-        return netagent.from_spec(spec[4:], seed=seed, threads=threads)
+        return netagent.from_spec(spec[4:], seed=seed, threads=threads, device=device)
     raise ValueError(spec)
 
 

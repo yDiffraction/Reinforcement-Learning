@@ -49,13 +49,31 @@ class NetAgent:
         return [a[0], a[1]]
 
 
-def from_spec(spec, seed=None, threads=1):
-    """'path.pt[:k1=24][:deepen=8][:temperature=0.5]...'"""
+def pick_device(name='auto'):
+    """'auto' prefers CUDA, then Intel XPU (torch.xpu, e.g. an iGPU), then CPU."""
+    if name != 'auto':
+        return name
+    if torch.cuda.is_available():
+        return 'cuda'
+    if hasattr(torch, 'xpu') and torch.xpu.is_available():
+        return 'xpu'
+    return 'cpu'
+
+
+def from_spec(spec, seed=None, threads=1, device='cpu'):
+    """'path.pt[:k1=24][:deepen=8][:temperature=0.5][:device=xpu]...'"""
     parts = spec.split(':')
+    # Windows paths: re-join a drive letter split off by the ':' separator
+    if len(parts) > 1 and len(parts[0]) == 1 and parts[1][:1] in ('\\', '/'):
+        parts = [parts[0] + ':' + parts[1]] + parts[2:]
     torch.set_num_threads(threads)
-    net, _ = model.load(parts[0])
     kw = {}
     for kv in parts[1:]:
         k, v = kv.split('=')
-        kw[k] = float(v) if k in ('temperature', 'noise', 'beta', 'solo_temperature') else int(v)
-    return NetAgent(net, seed=seed, **kw)
+        if k == 'device':
+            device = v
+        else:
+            kw[k] = float(v) if k in ('temperature', 'noise', 'beta', 'solo_temperature', 'budget') else int(v)
+    device = pick_device(device)
+    net, _ = model.load(parts[0], device)
+    return NetAgent(model.fuse(net), device=device, seed=seed, **kw)

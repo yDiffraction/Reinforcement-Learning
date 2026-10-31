@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hopechess · Play the bot</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <header>
+    <span class="brand">hopechess<span class="dot">.</span> <small>bot table</small></span>
+    <span id="server-label" class="server-label"></span>
+  </header>
+  <main>
+    <section class="table">
+      <div class="strip" id="top-strip"></div>
+      <div class="board-wrap"><div id="board" class="board" role="grid" aria-label="Board"></div><div id="board-overlay" class="board-overlay" hidden></div></div>
+      <div class="strip" id="bottom-strip"></div>
+      <p id="status" class="status" role="status"></p>
+    </section>
+
+    <aside>
+      <!-- setup -->
+      <form id="setup" class="panel">
+        <h2>New game</h2>
+        <label>Game server<input id="server" type="url" required></label>
+        <div class="row">
+          <label>Mode<select id="mode"><option value="1v1">1v1</option><option value="2v2">2v2</option></select></label>
+          <label>Your pieces<select id="color"><option value="white">White</option><option value="black">Black</option><option value="random">Random</option></select></label>
+        </div>
+        <div class="row">
+          <label>Time per side<select id="minutes">
+            <option value="">No limit</option><option value="1">1 min</option><option value="3">3 min</option><option value="5">5 min</option>
+            <option value="10">10 min</option><option value="15">15 min</option><option value="30">30 min</option><option value="60">1 hour</option>
+          </select></label>
+          <label class="check"><input id="rated" type="checkbox"> Rated (Elo)</label>
+        </div>
+        <div class="row team-only" hidden>
+          <label>Your teammate<select id="mate"><option value="bot">Bot</option><option value="open">Open seat (a friend joins on the website)</option></select></label>
+          <label>Opponents<select id="opps"><option value="2">Two bots</option><option value="1">One bot + open seat</option><option value="0">Open seats</option></select></label>
+        </div>
+
+        <h3>Bot</h3>
+        <div class="row">
+          <label>Engine<select id="engine"></select></label>
+          <label class="net-only">Device<select id="device"></select></label>
+        </div>
+        <label class="net-only">Thinking time per move <output id="think-out"></output>
+          <input id="think" type="range" min="0" max="10" step="0.5" value="7.5">
+          <small>The search keeps re-searching likely joint moves one round deeper until this time is up. 0 = one fixed step.</small></label>
+        <label class="net-only">Depth-2 step width <output id="deepen-out"></output>
+          <input id="deepen" type="range" min="0" max="32" step="1" value="16">
+          <small>Joint moves re-searched per step. 0 = depth 1 only (fastest).</small></label>
+        <label class="net-only">Candidate moves per side <output id="k1-out"></output>
+          <input id="k1" type="range" min="8" max="48" step="2" value="24">
+          <small>How many of the network's top moves enter the matrix game.</small></label>
+        <label class="net-only">Temperature <output id="temp-out"></output>
+          <input id="temperature" type="range" min="0" max="1.5" step="0.1" value="1">
+          <small>1 samples the Nash mix (unpredictable, as trained); 0 always plays the top move.</small></label>
+        <label class="net-only check"><input id="budget" type="checkbox" checked> Think less when the clock runs low</label>
+        <label class="team-only" hidden>Bot teammate waits for your move <output id="wait-out"></output>
+          <input id="wait" type="range" min="0" max="20" step="1" value="6">
+          <small>Then it moves first with a move robust to your likely replies.</small></label>
+
+        <details id="account">
+          <summary>Account <span id="account-name">· guest</span></summary>
+          <div id="signed-out">
+            <div class="row"><label>Username<input id="username" autocomplete="username"></label>
+            <label>Password<input id="password" type="password" autocomplete="current-password"></label></div>
+            <button type="button" id="login">Sign in on the game server</button>
+          </div>
+          <div id="signed-in" hidden><button type="button" id="logout">Sign out</button></div>
+          <small>Only your seat uses the account. Bots join as guests.</small>
+        </details>
+
+        <button id="start" class="primary" type="submit">Start game</button>
+        <p id="setup-error" class="error" hidden></p>
+
+        <details>
+          <summary>Add a bot to an existing room</summary>
+          <small>Play on the website itself: create a room there, then send a bot into it.</small>
+          <div class="row"><label>Room code<input id="join-code" inputmode="numeric" maxlength="4" placeholder="0000"></label>
+          <label>Bot team<select id="join-team"><option value="random">Any open seat</option><option value="white">White</option><option value="black">Black</option></select></label></div>
+          <button type="button" id="join-bot">Send bot</button>
+        </details>
+      </form>
+
+      <!-- running game -->
+      <section id="game" class="panel" hidden>
+        <div class="room-line"><span>Room <strong id="room-code"></strong></span><span id="conn" class="conn">connecting</span></div>
+        <div class="links"><a id="watch-link" target="_blank" rel="noopener">Watch on website ↗</a><a id="invite-link" target="_blank" rel="noopener">Invite link ↗</a></div>
+        <div id="roster" class="roster"></div>
+        <div id="last-round" class="last-round"></div>
+        <div class="actions">
+          <button id="resign">Resign</button><button id="rematch">Rematch</button><button id="leave">Leave</button>
+        </div>
+        <h3>Bot log</h3>
+        <div id="bot-log" class="bot-log"></div>
+      </section>
+      <section id="bot-only" class="panel" hidden>
+        <h2>Bots in other rooms</h2>
+        <div id="other-bots" class="bot-log"></div>
+        <button id="stop-others">Stop these bots</button>
+      </section>
+    </aside>
+  </main>
+  <dialog id="promo"><p>Promote to</p><div id="promo-options"></div></dialog>
+</body>
+</html>

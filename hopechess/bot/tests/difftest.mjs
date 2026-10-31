@@ -1,7 +1,11 @@
 // Replays games recorded by difftest.py through the upstream engine.js and
 // prints per-round snapshots so the C++ port can be compared exactly.
+// HC_ENGINE_JS=/path/to/engine.js compares against another copy (e.g. a live site's).
 import { readFileSync } from 'node:fs';
-import { createInitialState, getLegalMoves, getTeamLegalMoves, resolveRound, resolveTeamRound } from '../../upstream/engine.js';
+import { pathToFileURL } from 'node:url';
+
+const enginePath = process.env.HC_ENGINE_JS ? pathToFileURL(process.env.HC_ENGINE_JS).href : '../../upstream/engine.js';
+const { createInitialState, getLegalMoves, getTeamLegalMoves, resolveRound, resolveTeamRound } = await import(enginePath);
 
 const PROMO = { q: 1, r: 2, b: 3, n: 4 };
 const code = m => m.from | (m.to << 6) | ((m.promotion ? PROMO[m.promotion] : 0) << 12);
